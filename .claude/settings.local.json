@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($cmds = @\\('py','python3','conda','streamlit'\\); foreach\\($c in $cmds\\){ $g = Get-Command $c -ErrorAction SilentlyContinue; if\\($g\\){ \"$c -> $\\($g.Source\\)\" } else { \"$c -> \\(no encontrado\\)\" } })",
+      "PowerShell(py -0p)",
+      "PowerShell(py -c \"import streamlit,tensorflow,pandas,numpy,plotly,yfinance,ta,joblib,sklearn,sys; print\\(sys.version\\); print\\('streamlit',streamlit.__version__\\); print\\('tensorflow',tensorflow.__version__\\); print\\('pandas',pandas.__version__\\); print\\('numpy',numpy.__version__\\); print\\('plotly',plotly.__version__\\); print\\('yfinance',yfinance.__version__\\); print\\('ta',ta.__version__\\); print\\('joblib',joblib.__version__\\); print\\('scikit-learn',sklearn.__version__\\)\")"
+    ]
+  }
+}

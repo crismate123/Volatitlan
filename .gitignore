@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+.env
+*.log
+
+# Export estático pesado del análisis de portafolio (no lo usa la app web)
+Portafolio Buffet.htm
+Portafolio Buffet_files/
