@@ -23,14 +23,28 @@ Criterios de diseño de las variables:
    negativos la elevan), no la dirección que miden RSI/MACD.
 """
 
+import time
 import warnings
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+_CARPETA = Path(__file__).resolve().parent
+
+# Copia local del histórico, versionada en el repositorio. Yahoo Finance
+# limita las peticiones que llegan desde IPs de centros de datos, así que en
+# un despliegue en la nube la descarga en vivo puede fallar de forma
+# permanente. Con este respaldo la app sigue funcionando (con datos hasta la
+# fecha del archivo) en lugar de quedar inutilizable.
+ARCHIVO_RESPALDO = _CARPETA / "datos_respaldo.csv"
+
+REINTENTOS = 3
+ESPERA_REINTENTO = 1.5  # segundos, se duplica en cada intento
 
 
 # ==========================================
@@ -69,29 +83,29 @@ _EPS = 1e-8
 # ==========================================
 # 1. Descarga
 # ==========================================
-def descargar_datos(fecha_inicio=FECHA_INICIO, fecha_fin=None):
-    """
-    Descarga OHLCV del ^GSPC y el cierre del ^VIX, alineados en un solo frame.
+def _bajar(ticker, str_inicio, str_fin):
+    """Descarga un ticker con reintentos ante límites de tasa transitorios."""
+    ultimo_error = None
+    for intento in range(REINTENTOS):
+        try:
+            d = yf.download(ticker, start=str_inicio, end=str_fin,
+                            auto_adjust=False, progress=False)
+            if not d.empty:
+                if isinstance(d.columns, pd.MultiIndex):
+                    d.columns = d.columns.get_level_values(0)
+                return d
+            ultimo_error = ValueError(f"yfinance devolvió un frame vacío para {ticker}.")
+        except Exception as e:  # red, rate limit, cambio de esquema...
+            ultimo_error = e
+        if intento < REINTENTOS - 1:
+            time.sleep(ESPERA_REINTENTO * (2 ** intento))
+    raise ValueError(f"yfinance no devolvió datos para {ticker}: {ultimo_error}")
 
-    Se descargan por separado y se unen por índice: `yf.download` con varios
-    tickers devuelve columnas MultiIndex y alinea con NaN de forma silenciosa.
-    """
-    if fecha_fin is None:
-        fecha_fin = datetime.today() + timedelta(days=1)  # `end` es exclusivo
-    str_inicio = pd.Timestamp(fecha_inicio).strftime("%Y-%m-%d")
-    str_fin = pd.Timestamp(fecha_fin).strftime("%Y-%m-%d")
 
-    def _bajar(ticker):
-        d = yf.download(ticker, start=str_inicio, end=str_fin,
-                        auto_adjust=False, progress=False)
-        if d.empty:
-            raise ValueError(f"yfinance no devolvió datos para {ticker}.")
-        if isinstance(d.columns, pd.MultiIndex):
-            d.columns = d.columns.get_level_values(0)
-        return d
-
-    sp = _bajar("^GSPC")
-    vix = _bajar("^VIX")
+def _descargar_yahoo(str_inicio, str_fin):
+    """OHLCV del ^GSPC más el cierre del ^VIX, alineados en un solo frame."""
+    sp = _bajar("^GSPC", str_inicio, str_fin)
+    vix = _bajar("^VIX", str_inicio, str_fin)
 
     faltantes = {"Open", "High", "Low", "Close", "Volume"}.difference(sp.columns)
     if faltantes:
@@ -101,8 +115,80 @@ def descargar_datos(fecha_inicio=FECHA_INICIO, fecha_fin=None):
     # ffill corto: cubre feriados desalineados entre ambos índices sin
     # inventar datos en huecos largos.
     df["VIX"] = vix["Close"].reindex(df.index).ffill(limit=5)
-
     return df.dropna(subset=["VIX"])
+
+
+def _cargar_respaldo():
+    """Lee la copia local del histórico. Devuelve None si no existe."""
+    if not ARCHIVO_RESPALDO.exists():
+        return None
+    d = pd.read_csv(ARCHIVO_RESPALDO, index_col=0, parse_dates=True)
+    return d if not d.empty else None
+
+
+def descargar_datos(fecha_inicio=FECHA_INICIO, fecha_fin=None, usar_respaldo=True):
+    """
+    Devuelve OHLCV del ^GSPC + VIX para el rango pedido.
+
+    Combina la descarga en vivo con el respaldo versionado: si Yahoo responde,
+    sus filas tienen prioridad y el respaldo solo rellena hacia atrás; si Yahoo
+    falla por completo (bloqueo desde IP de nube), la app sigue operando con el
+    respaldo en lugar de caerse.
+
+    El frame lleva `df.attrs["fuente"]` con el origen efectivo de los datos
+    ("yahoo", "respaldo" o "mixto") para que la interfaz pueda avisarlo.
+    """
+    if fecha_fin is None:
+        fecha_fin = datetime.today() + timedelta(days=1)  # `end` es exclusivo
+    ts_inicio, ts_fin = pd.Timestamp(fecha_inicio), pd.Timestamp(fecha_fin)
+    str_inicio, str_fin = ts_inicio.strftime("%Y-%m-%d"), ts_fin.strftime("%Y-%m-%d")
+
+    try:
+        vivo = _descargar_yahoo(str_inicio, str_fin)
+    except Exception as error_vivo:
+        vivo = None
+        if not usar_respaldo:
+            raise
+        motivo = error_vivo
+
+    respaldo = _cargar_respaldo() if usar_respaldo else None
+
+    if vivo is None and respaldo is None:
+        raise ValueError(
+            f"Sin datos: la descarga falló ({motivo}) y no hay respaldo local en "
+            f"{ARCHIVO_RESPALDO.name}."
+        )
+
+    if vivo is None:
+        df, fuente = respaldo.copy(), "respaldo"
+    elif respaldo is None:
+        df, fuente = vivo, "yahoo"
+    else:
+        previas = respaldo[~respaldo.index.isin(vivo.index)]
+        df = pd.concat([previas, vivo]).sort_index()
+        fuente = "mixto" if len(previas) else "yahoo"
+
+    df = df.loc[(df.index >= ts_inicio) & (df.index < ts_fin)]
+    if df.empty:
+        raise ValueError(f"No hay datos disponibles entre {str_inicio} y {str_fin}.")
+
+    df.attrs["fuente"] = fuente
+    return df
+
+
+def guardar_respaldo(fecha_inicio="2015-01-01", fecha_fin=None):
+    """
+    Regenera el archivo de respaldo desde Yahoo.
+
+    Ejecutar desde una máquina con acceso (no desde el servidor de despliegue)
+    y versionar el resultado. Conviene actualizarlo cada vez que se reentrena.
+    """
+    df = _descargar_yahoo(
+        pd.Timestamp(fecha_inicio).strftime("%Y-%m-%d"),
+        pd.Timestamp(fecha_fin or datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d"),
+    )
+    df.to_csv(ARCHIVO_RESPALDO)
+    return df
 
 
 # ==========================================

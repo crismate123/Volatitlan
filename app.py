@@ -316,7 +316,11 @@ def cargar_datos_dashboard():
     d["ATR"] = ta.volatility.AverageTrueRange(d["High"], d["Low"], d["Close"], window=14).average_true_range()
     d["Momento"] = ta.momentum.ROCIndicator(d["Close"], window=10).roc()
     d["Vol_Pct_Change"] = d["Volume"].pct_change()
-    return d.replace([np.inf, -np.inf], np.nan).dropna()
+    limpio = d.replace([np.inf, -np.inf], np.nan).dropna()
+    # `attrs` se propaga en la mayoría de operaciones de pandas, pero se fija
+    # de forma explícita para que la interfaz pueda avisar del origen.
+    limpio.attrs["fuente"] = df.attrs.get("fuente", "yahoo")
+    return limpio
 
 
 def estilo_grafica(fig, titulo, altura=320):
@@ -409,6 +413,29 @@ with tab1:
     if not modelo_cargado:
         st.error(f"⚠️ No se pudo cargar el modelo. Verifica que 'modelo_lstm_sp500_volatilidad.keras' y los escaladores existan. Detalle: {error_msg}")
     else:
+        # Aviso de frescura: Yahoo Finance bloquea peticiones desde IPs de
+        # centros de datos, así que en la nube la descarga puede caer al
+        # respaldo local. Mostrar pronósticos con datos viejos sin avisar
+        # sería peor que no mostrarlos.
+        try:
+            _datos = cargar_datos_dashboard()
+            _ultimo = _datos.index.max()
+            _dias = (pd.Timestamp.today().normalize() - _ultimo.normalize()).days
+            _fuente = _datos.attrs.get("fuente", "yahoo")
+            if _fuente == "respaldo":
+                st.warning(
+                    f"⚠️ Yahoo Finance no respondió; se está usando la copia local del "
+                    f"histórico, con datos hasta el {_ultimo:%d/%m/%Y} ({_dias} días). "
+                    f"Los pronósticos no incorporan las sesiones más recientes."
+                )
+            elif _dias > 5:
+                st.info(
+                    f"ℹ️ Último dato de mercado disponible: {_ultimo:%d/%m/%Y} "
+                    f"({_dias} días de antigüedad)."
+                )
+        except Exception:
+            pass  # el aviso es accesorio: nunca debe tumbar la página
+
         # Fila 1: Desempeño del pronóstico (calculado en vivo, no valores fijos)
         st.markdown("<p class='section-title'>Desempeño del Pronóstico</p>", unsafe_allow_html=True)
         st.markdown("<p class='section-caption'>Predicciones reconstruidas <b>día a día</b> sobre los últimos 2 años (~500 ventanas solapadas) frente a la volatilidad realizada observada. El baseline de comparación es la persistencia: suponer que la volatilidad de la próxima semana será igual a la de la semana pasada.</p>", unsafe_allow_html=True)

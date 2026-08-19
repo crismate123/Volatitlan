@@ -7,7 +7,8 @@
       "PowerShell(py -c \"import Caracteristicas as C; df = C.cargar_dataset\\('2020-01-01'\\); print\\('shape', df.shape\\); print\\(df.columns.tolist\\(\\)\\); print\\(df[['log_RV_1d','log_RV_5d','log_VIX','IV_RV_Spread','Asimetria','Target']].tail\\(3\\).round\\(4\\)\\)\")",
       "PowerShell(py Entrenamiento.py 2>&1 | Tee-Object -FilePath \"$env:TEMP\\\\volatitlan_train.log\")",
       "PowerShell($env:PYTHONPATH = \"C:\\\\Users\\\\cm180\\\\OneDrive\\\\Martingalo\\\\Volatitlan\"; py \"C:\\\\Users\\\\cm180\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-cm180-OneDrive-Martingalo-Volatitlan\\\\0899179d-16ad-4b5c-9de8-030ffee8bbe8\\\\scratchpad\\\\comparar.py\" 2>$null)",
-      "PowerShell(git -C \"C:\\\\Users\\\\cm180\\\\OneDrive\\\\Martingalo\\\\Volatitlan\" status --short)"
+      "PowerShell(git -C \"C:\\\\Users\\\\cm180\\\\OneDrive\\\\Martingalo\\\\Volatitlan\" status --short)",
+      "PowerShell($env:PYTHONPATH = \"C:\\\\Users\\\\cm180\\\\OneDrive\\\\Martingalo\\\\Volatitlan\"; py -c \"import yfinance as yf, pandas as pd; d = yf.download\\('^GSPC', period='1mo', auto_adjust=False, progress=False\\); print\\('GSPC filas:', len\\(d\\)\\); v = yf.download\\('^VIX', period='1mo', auto_adjust=False, progress=False\\); print\\('VIX filas:', len\\(v\\)\\); print\\(d.tail\\(2\\)\\)\" 2>$null)"
     ]
   }
 }
