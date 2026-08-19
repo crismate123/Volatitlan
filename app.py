@@ -3,15 +3,15 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import yfinance as yf
 import ta
 from pathlib import Path
 
 # Carpeta donde vive app.py (para localizar recursos como la fotografía)
 _CARPETA_APP = Path(__file__).resolve().parent
 from datetime import datetime, timedelta
-# Importamos la clase que ya construimos en tu script prediccion.py
+# Pipeline de inferencia y descarga de datos (mismos módulos que el entrenamiento)
 from Prediccion import PredictorVolatilidad
+from Caracteristicas import descargar_datos
 
 # ==========================================
 # 1. Configuración inicial de la página
@@ -223,60 +223,65 @@ st.markdown("""
 # ==========================================
 # 3.5 Evaluación histórica del pronóstico (Backtest Out-of-Sample)
 # ==========================================
+def _metricas(real, pred):
+    """
+    Métricas de pronóstico sobre niveles de RV.
+
+    Se incluye MdAPE y QLIKE además del MAPE: en volatilidad el MAPE está
+    dominado por los periodos de calma (denominador pequeño), mientras que
+    QLIKE es la pérdida estándar de la literatura y penaliza correctamente
+    subestimar la volatilidad en los episodios de estrés.
+    """
+    real = np.asarray(real, dtype=float)
+    pred = np.clip(np.asarray(pred, dtype=float), 1e-8, None)
+    err = real - pred
+    ape = np.abs(err) / np.abs(real)
+    return {
+        "RMSE": float(np.sqrt(np.mean(err ** 2))),
+        "MAE": float(np.mean(np.abs(err))),
+        "MAPE": float(np.mean(ape) * 100),
+        "MdAPE": float(np.median(ape) * 100),
+        "QLIKE": float(np.mean(np.log(pred ** 2) + (real ** 2) / (pred ** 2))),
+    }
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def evaluar_desempeno_historico(anios=2):
     """
-    Reconstruye las predicciones del modelo sobre los últimos `anios` años
-    y las compara contra la volatilidad realizada observada.
+    Reconstruye las predicciones del modelo sobre los últimos `anios` años y
+    las compara contra la volatilidad realizada observada y contra el baseline
+    de persistencia ("la próxima semana será como la pasada").
     """
     hoy = datetime.today()
-    inicio = hoy - timedelta(days=int(anios * 365) + 200)  # buffer para rolling de 60d
+    # Buffer amplio: la RV a 66 días y las medias móviles de 22 consumen ~90
+    # sesiones de calentamiento antes de la primera fila utilizable.
+    inicio = hoy - timedelta(days=int(anios * 365) + 320)
 
-    df = yf.download(
-        "^GSPC",
-        start=inicio.strftime("%Y-%m-%d"),
-        end=(hoy + timedelta(days=1)).strftime("%Y-%m-%d"),
-        auto_adjust=False,
-        progress=False,
-    )
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    df = descargar_datos(inicio, hoy + timedelta(days=1))
+    feats = predictor.preparar(df)
+    X_esc, harx = predictor.matrices(feats)
 
-    # Features con el mismo pipeline de inferencia
-    feats = predictor.ingenieria_caracteristicas_inferencia(df)
-
-    # Volatilidad realizada futura observada: RV(t+5) = sqrt(suma r^2 de 5 días siguientes)
+    # Volatilidad realizada futura observada: RV(t+1..t+5)
     log_ret = np.log(df["Close"] / df["Close"].shift(1))
     rv_5d = np.sqrt((log_ret ** 2).rolling(window=5).sum())
-    target = rv_5d.shift(-5).reindex(feats.index)
+    y = rv_5d.shift(-5).reindex(feats.index).to_numpy()
 
-    X_scaled = predictor.scaler_x.transform(feats)
-    y = target.to_numpy()
-
-    ventanas, reales, fechas = [], [], []
-    for i in range(60, len(feats)):
-        if np.isnan(y[i]):
-            continue  # últimos 5 días: el futuro aún no se observa
-        ventanas.append(X_scaled[i - 60 : i])
-        reales.append(y[i])
-        fechas.append(feats.index[i])
-
-    if not ventanas:
+    # Se excluyen los últimos días: su futuro todavía no se observa
+    filas = [i for i in range(predictor.ventana, len(feats)) if not np.isnan(y[i])]
+    if not filas:
         raise ValueError("No hay suficientes datos para evaluar el desempeño.")
 
-    pred_escalada = predictor.modelo.predict(np.asarray(ventanas), verbose=0)
-    pred = predictor.desescalar_prediccion(pred_escalada).ravel()
+    pred, filas_ok = predictor.predecir_en_filas(X_esc, harx, filas)
+    reales = y[filas_ok]
+    naive = feats["RV_5d"].to_numpy()[filas_ok]
 
     resultado = pd.DataFrame(
-        {"Real": reales, "Predicción": pred},
-        index=pd.DatetimeIndex(fechas),
+        {"Real": reales, "Predicción": pred, "Persistencia": naive},
+        index=feats.index[filas_ok],
     )
-
-    error = resultado["Real"] - resultado["Predicción"]
     metricas = {
-        "RMSE": float(np.sqrt((error ** 2).mean())),
-        "MAE": float(error.abs().mean()),
-        "MAPE": float((error.abs() / resultado["Real"].abs()).mean() * 100),
+        "modelo": _metricas(reales, pred),
+        "persistencia": _metricas(reales, naive),
     }
     return resultado, metricas
 
@@ -286,18 +291,18 @@ def evaluar_desempeno_historico(anios=2):
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def cargar_datos_dashboard():
-    """Descarga ~6 años del S&P 500 y calcula los indicadores del mercado."""
+    """
+    Descarga ~6 años del S&P 500 junto al VIX y calcula los indicadores.
+
+    El VIX es imprescindible: forma parte de las variables del modelo, así que
+    este frame alimenta tanto las gráficas del dashboard como el pronóstico.
+    Los indicadores técnicos (RSI, MACD, ATR, Momentum) ya no son entradas del
+    modelo —fueron sustituidos por medidas de asimetría— pero se conservan
+    como lectura visual del mercado en la pestaña de dashboard.
+    """
     hoy = datetime.today()
     inicio = hoy - timedelta(days=6 * 365)
-    df = yf.download(
-        "^GSPC",
-        start=inicio.strftime("%Y-%m-%d"),
-        end=(hoy + timedelta(days=1)).strftime("%Y-%m-%d"),
-        auto_adjust=False,
-        progress=False,
-    )
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    df = descargar_datos(inicio, hoy + timedelta(days=1))
 
     d = df.copy()
     d["Log_Ret"] = np.log(d["Close"] / d["Close"].shift(1))
@@ -342,34 +347,36 @@ def historial_semanal(n_semanas=26):
     viernes previo) y se compara con la RV realizada de esa misma semana.
     """
     df = cargar_datos_dashboard()
-    feats = predictor.ingenieria_caracteristicas_inferencia(df)
-    X_all = predictor.scaler_x.transform(feats)
+    feats = predictor.preparar(df)
+    X_esc, harx = predictor.matrices(feats)
     idx = feats.index
 
     ultimo = df.index.max()
     lunes_actual = (ultimo - pd.Timedelta(days=int(ultimo.weekday()))).normalize()
     lunes_lista = [lunes_actual - pd.Timedelta(weeks=k) for k in range(n_semanas - 1, -1, -1)]
 
-    ventanas, filas = [], []
+    filas, meta = [], {}
     for lunes in lunes_lista:
-        pos = idx.searchsorted(lunes)  # primera sesión de la semana
-        if pos < 60:
+        pos = int(idx.searchsorted(lunes))  # primera sesión de la semana
+        if pos < predictor.ventana or pos >= len(idx):
             continue  # sin historial suficiente para formar la ventana
-        ventanas.append(X_all[pos - 60 : pos])
 
         sem = df[(df.index >= lunes) & (df.index < lunes + pd.Timedelta(days=7))].head(5)
-        filas.append({
+        filas.append(pos)
+        meta[pos] = {
             "Semana": lunes,
             "Real": float(np.sqrt((sem["Log_Ret"] ** 2).sum())) if len(sem) else np.nan,
             "Sesiones": len(sem),
-        })
+            # Baseline de persistencia: la RV de la semana previa al pronóstico
+            "Persistencia": float(feats["RV_5d"].to_numpy()[pos]),
+        }
 
-    if not ventanas:
+    if not filas:
         raise ValueError("No hay historial suficiente para construir la serie semanal.")
 
-    pred_esc = predictor.modelo.predict(np.asarray(ventanas), verbose=0)
-    res = pd.DataFrame(filas).set_index("Semana")
-    res["Pronostico"] = predictor.desescalar_prediccion(pred_esc).ravel()
+    pred, filas_ok = predictor.predecir_en_filas(X_esc, harx, filas)
+    res = pd.DataFrame([meta[p] for p in filas_ok]).set_index("Semana")
+    res["Pronostico"] = pred
     res["Completa"] = res["Sesiones"] >= 5
     return res
 
@@ -404,16 +411,23 @@ with tab1:
     else:
         # Fila 1: Desempeño del pronóstico (calculado en vivo, no valores fijos)
         st.markdown("<p class='section-title'>Desempeño del Pronóstico</p>", unsafe_allow_html=True)
-        st.markdown("<p class='section-caption'>Predicciones del modelo reconstruidas sobre los últimos 2 años y comparadas contra la volatilidad realizada observada.</p>", unsafe_allow_html=True)
+        st.markdown("<p class='section-caption'>Predicciones reconstruidas <b>día a día</b> sobre los últimos 2 años (~500 ventanas solapadas) frente a la volatilidad realizada observada. El baseline de comparación es la persistencia: suponer que la volatilidad de la próxima semana será igual a la de la semana pasada.</p>", unsafe_allow_html=True)
 
         try:
             with st.spinner("Evaluando el modelo sobre datos históricos..."):
                 df_eval, metricas = evaluar_desempeno_historico(anios=2)
 
-            col1, col2, col3 = st.columns(3)
-            col1.metric("MAPE", f"{metricas['MAPE']:.1f}%")
-            col2.metric("RMSE", f"{metricas['RMSE']:.5f}")
-            col3.metric("MAE", f"{metricas['MAE']:.5f}")
+            mm, mp = metricas["modelo"], metricas["persistencia"]
+            col1, col2, col3, col4 = st.columns(4)
+            # delta_color="inverse": en métricas de error, menos es mejor
+            col1.metric("MAPE diario (2 años)", f"{mm['MAPE']:.1f}%",
+                        delta=f"{mm['MAPE'] - mp['MAPE']:+.1f} pp vs. persistencia",
+                        delta_color="inverse")
+            col2.metric("MdAPE (mediana)", f"{mm['MdAPE']:.1f}%")
+            col3.metric("RMSE", f"{mm['RMSE']:.5f}")
+            col4.metric("QLIKE", f"{mm['QLIKE']:.3f}",
+                        delta=f"{mm['QLIKE'] - mp['QLIKE']:+.3f} vs. persistencia",
+                        delta_color="inverse")
 
             st.markdown("<br>", unsafe_allow_html=True)
 
@@ -426,8 +440,15 @@ with tab1:
             ))
             fig_perf.add_trace(go.Scatter(
                 x=df_eval.index, y=df_eval["Predicción"],
-                mode="lines", name="Predicción LSTM",
+                mode="lines", name="Pronóstico HAR-X + LSTM",
                 line=dict(color="#3B82F6", width=1.8),
+            ))
+            # Baseline visible: sin él, ninguna curva de pronóstico se puede juzgar
+            fig_perf.add_trace(go.Scatter(
+                x=df_eval.index, y=df_eval["Persistencia"],
+                mode="lines", name="Persistencia (baseline)",
+                line=dict(color="#94A3B8", width=1.1, dash="dot"),
+                opacity=0.75,
             ))
             fig_perf.update_layout(
                 title="Volatilidad Real vs. Predicha (RV a 5 días)",
@@ -499,10 +520,12 @@ with tab1:
 
             if len(completas) >= 2:
                 err_rel = (completas["Real"] - completas["Pronostico"]).abs() / completas["Real"]
+                err_naive = (completas["Real"] - completas["Persistencia"]).abs() / completas["Real"]
                 aciertos = float((err_rel <= 0.20).mean() * 100)
                 st.markdown(
                     f"<p class='section-caption'>📊 Sobre las {len(completas)} semanas completas mostradas: "
-                    f"error medio de <b>{err_rel.mean() * 100:.1f}%</b> y "
+                    f"error medio de <b>{err_rel.mean() * 100:.1f}%</b> "
+                    f"(persistencia: {err_naive.mean() * 100:.1f}%) y "
                     f"<b>{aciertos:.0f}%</b> de las semanas pronosticadas con menos de 20% de desviación. "
                     f"El último punto de la serie observada corresponde a la semana en curso, aún incompleta.</p>",
                     unsafe_allow_html=True,
@@ -526,9 +549,11 @@ with tab1:
                     line=dict(color="#3B82F6", width=2.8),
                     hovertemplate="Semana del %{x|%d/%m/%Y}<br>MAPE móvil: %{y:.1f}%<extra></extra>",
                 ))
+                # "Global" sería engañoso: este promedio solo cubre las semanas
+                # visibles y cambia con el selector de arriba.
                 fig_mape.add_hline(
                     y=float(ape.mean()), line_dash="dash", line_color="#E2E8F0",
-                    annotation_text=f"MAPE global {ape.mean():.1f}%",
+                    annotation_text=f"MAPE de las {len(completas)} semanas mostradas: {ape.mean():.1f}%",
                     annotation_position="top left", annotation_font_color="#E2E8F0",
                 )
                 fig_mape.add_hrect(y0=0, y1=20, fillcolor="rgba(34,197,94,0.08)", line_width=0)
@@ -539,7 +564,10 @@ with tab1:
 
                 st.markdown(
                     "<p class='section-caption'>💡 La línea clara es el error de cada semana y la azul su promedio móvil de 8 semanas, que revela si el modelo mejora o se degrada con el tiempo. "
-                    "La banda verde marca la zona objetivo (por debajo del 20% de error).</p>",
+                    "La banda verde marca la zona objetivo (por debajo del 20% de error).<br>"
+                    "⚠️ Este error semanal <b>no es comparable</b> con el MAPE diario de la sección anterior y suele ser menor: "
+                    "aquí hay un pronóstico por semana (sin solapamiento) sobre el periodo visible, mientras que arriba hay uno por día "
+                    "sobre dos años, y cada episodio de volatilidad se cuenta unas cinco veces.</p>",
                     unsafe_allow_html=True,
                 )
 
@@ -553,12 +581,12 @@ with tab1:
         st.markdown("<p class='section-caption'>Descarga los datos más recientes del mercado y genera la predicción de volatilidad para los próximos 5 días hábiles.</p>", unsafe_allow_html=True)
 
         if st.button("🚀 Generar Predicción a 5 Días", use_container_width=True):
-            with st.spinner('Conectando con Yahoo Finance y procesando tensores de 60 días...'):
+            with st.spinner(f'Conectando con Yahoo Finance y procesando tensores de {predictor.ventana} días...'):
                 try:
                     # Ejecutar inferencia
                     volatilidad_esperada = predictor.predecir_futuro()
                     df_reciente = predictor.obtener_datos_recientes()
-                    df_plot = df_reciente.tail(60) # Usamos los 60 días de la ventana
+                    df_plot = df_reciente.tail(60)  # contexto visual, más amplio que la ventana
 
                     # Mostrar el resultado destacado
                     st.success("✅ Inferencia completada con éxito.")
@@ -741,11 +769,14 @@ with tab2:
             fig_vpc.update_layout(showlegend=False)
             st.plotly_chart(fig_vpc, use_container_width=True)
 
-        # ---------- Matriz de correlación de las 14 predictoras ----------
-        cols_predictoras = ["Open", "High", "Low", "Close", "Volume", "Log_Ret",
-                            "Vol_5d", "Vol_20d", "Vol_60d", "RSI", "MACD", "ATR",
-                            "Momento", "Vol_Pct_Change"]
-        corr = d[cols_predictoras].corr()
+        # ---------- Matriz de correlación de las variables REALES del modelo ----------
+        # Se calculan con el mismo pipeline que usa el pronóstico, no con los
+        # indicadores visuales de arriba: la matriz debe describir lo que el
+        # modelo efectivamente consume.
+        feats_modelo = predictor.preparar(df_dash)
+        feats_modelo = feats_modelo[feats_modelo.index >= corte]
+        cols_predictoras = predictor.columnas_features
+        corr = feats_modelo[cols_predictoras].corr()
         fig_corr = go.Figure(go.Heatmap(
             z=corr.values, x=cols_predictoras, y=cols_predictoras,
             zmin=-1, zmax=1,
@@ -754,7 +785,7 @@ with tab2:
             textfont=dict(size=9),
             colorbar=dict(tickfont=dict(color="white"), outlinewidth=0),
         ))
-        estilo_grafica(fig_corr, "Matriz de correlación de las variables predictoras", altura=560)
+        estilo_grafica(fig_corr, f"Matriz de correlación de las {len(cols_predictoras)} variables del modelo", altura=560)
         fig_corr.update_layout(hovermode="closest")
         fig_corr.update_yaxes(autorange="reversed")
         st.plotly_chart(fig_corr, use_container_width=True)

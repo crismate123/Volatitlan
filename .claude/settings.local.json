@@ -3,7 +3,11 @@
     "allow": [
       "PowerShell($cmds = @\\('py','python3','conda','streamlit'\\); foreach\\($c in $cmds\\){ $g = Get-Command $c -ErrorAction SilentlyContinue; if\\($g\\){ \"$c -> $\\($g.Source\\)\" } else { \"$c -> \\(no encontrado\\)\" } })",
       "PowerShell(py -0p)",
-      "PowerShell(py -c \"import streamlit,tensorflow,pandas,numpy,plotly,yfinance,ta,joblib,sklearn,sys; print\\(sys.version\\); print\\('streamlit',streamlit.__version__\\); print\\('tensorflow',tensorflow.__version__\\); print\\('pandas',pandas.__version__\\); print\\('numpy',numpy.__version__\\); print\\('plotly',plotly.__version__\\); print\\('yfinance',yfinance.__version__\\); print\\('ta',ta.__version__\\); print\\('joblib',joblib.__version__\\); print\\('scikit-learn',sklearn.__version__\\)\")"
+      "PowerShell(py -c \"import streamlit,tensorflow,pandas,numpy,plotly,yfinance,ta,joblib,sklearn,sys; print\\(sys.version\\); print\\('streamlit',streamlit.__version__\\); print\\('tensorflow',tensorflow.__version__\\); print\\('pandas',pandas.__version__\\); print\\('numpy',numpy.__version__\\); print\\('plotly',plotly.__version__\\); print\\('yfinance',yfinance.__version__\\); print\\('ta',ta.__version__\\); print\\('joblib',joblib.__version__\\); print\\('scikit-learn',sklearn.__version__\\)\")",
+      "PowerShell(py -c \"import Caracteristicas as C; df = C.cargar_dataset\\('2020-01-01'\\); print\\('shape', df.shape\\); print\\(df.columns.tolist\\(\\)\\); print\\(df[['log_RV_1d','log_RV_5d','log_VIX','IV_RV_Spread','Asimetria','Target']].tail\\(3\\).round\\(4\\)\\)\")",
+      "PowerShell(py Entrenamiento.py 2>&1 | Tee-Object -FilePath \"$env:TEMP\\\\volatitlan_train.log\")",
+      "PowerShell($env:PYTHONPATH = \"C:\\\\Users\\\\cm180\\\\OneDrive\\\\Martingalo\\\\Volatitlan\"; py \"C:\\\\Users\\\\cm180\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-cm180-OneDrive-Martingalo-Volatitlan\\\\0899179d-16ad-4b5c-9de8-030ffee8bbe8\\\\scratchpad\\\\comparar.py\" 2>$null)",
+      "PowerShell(git -C \"C:\\\\Users\\\\cm180\\\\OneDrive\\\\Martingalo\\\\Volatitlan\" status --short)"
     ]
   }
 }

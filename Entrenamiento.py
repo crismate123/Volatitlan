@@ -1,289 +1,307 @@
-import warnings
-from datetime import datetime, timedelta
+"""
+Entrenamiento del pronosticador de volatilidad del S&P 500.
+
+Arquitectura del sistema (no es solo una red):
+
+    log RV(t+1..t+5)  =  HAR-X(t)  +  LSTM(residual)(t)
+
+El HAR-X es una regresión lineal de 5 coeficientes sobre la volatilidad
+realizada diaria, semanal y mensual más el VIX. Es el estándar de la
+literatura y resulta muy difícil de batir. La red no compite con él: aprende
+únicamente lo que el HAR-X deja sin explicar. Consecuencias:
+
+  * el sistema nunca puede quedar materialmente peor que su baseline;
+  * la red recibe un objetivo de varianza mucho menor;
+  * si la red no aporta nada, se ve de inmediato en la tabla de benchmarks.
+
+Metodología de evaluación:
+
+  * Split temporal de tres vías 70/15/15 con purga de `HORIZONTE` filas en
+    cada frontera (los targets solapados cruzan el corte).
+  * La validación solo se usa para early stopping y para la corrección de
+    Jensen. El test se toca UNA vez, al final.
+  * Varias semillas promediadas: con un target solapado, la varianza entre
+    corridas es grande y una sola realización no es un resultado.
+  * Se reporta QLIKE además de los errores porcentuales. Es la pérdida
+    estándar en volatilidad porque es robusta al ruido del proxy de RV; el
+    MAPE está dominado por los periodos de calma, donde el denominador es
+    pequeño.
+"""
+
+import json
+from datetime import datetime
 from pathlib import Path
 
 import joblib
 import numpy as np
-import pandas as pd
-import ta
-import tensorflow as tf
-import yfinance as yf
 from sklearn.preprocessing import StandardScaler
-from tensorflow.keras.callbacks import EarlyStopping
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
-from tensorflow.keras.models import Sequential
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
+from Caracteristicas import (
+    COLUMNAS_HAR,
+    COLUMNAS_X,
+    FECHA_INICIO,
+    HORIZONTE,
+    VENTANA,
+    cargar_dataset,
+    construir_secuencias,
+)
+from Modelo import UNIDADES_LSTM, construir_lstm, ensamblar, n_parametros
 
-warnings.filterwarnings("ignore", category=FutureWarning)
+CARPETA = Path(__file__).resolve().parent
 
+ARCHIVO_MODELO = CARPETA / "modelo_lstm_sp500_volatilidad.keras"
+ARCHIVO_SCALER_X = CARPETA / "scaler_x_sp500_volatilidad.pkl"
+ARCHIVO_SCALER_Y = CARPETA / "scaler_y_sp500_volatilidad.pkl"
+ARCHIVO_CONFIG = CARPETA / "config_modelo_sp500_volatilidad.json"
 
-# ==========================================
-# 1. OBTENCION DE DATOS
-# ==========================================
-def obtener_datos_sp500(fecha_inicio="2015-01-01"):
-    hoy = datetime.today()
-    fecha_fin_yf = hoy + timedelta(days=1)  # yfinance usa end como fecha exclusiva
-    str_fin = fecha_fin_yf.strftime("%Y-%m-%d")
-
-    print(f"[*] Descargando datos del S&P 500 desde {fecha_inicio} hasta {str_fin}...")
-    df = yf.download(
-        "^GSPC",
-        start=fecha_inicio,
-        end=str_fin,
-        auto_adjust=False,
-        progress=False,
-    )
-
-    if df.empty:
-        raise ValueError("yfinance no devolvio datos para ^GSPC.")
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    columnas_necesarias = {"Open", "High", "Low", "Close", "Volume"}
-    columnas_faltantes = columnas_necesarias.difference(df.columns)
-    if columnas_faltantes:
-        raise ValueError(f"Faltan columnas requeridas: {sorted(columnas_faltantes)}")
-
-    return df
+N_SEMILLAS = 5
+EPOCAS = 120
+BATCH = 64
+PACIENCIA = 15
 
 
 # ==========================================
-# 2. INGENIERIA DE CARACTERISTICAS
+# 1. Métricas
 # ==========================================
-def ingenieria_caracteristicas(df):
-    print("[*] Generando variables predictoras y variable objetivo...")
-    datos = df.copy()
+def metricas(real, pred):
+    """
+    Métricas sobre niveles de RV. `real` y `pred` son desviaciones estándar.
 
-    datos["Log_Ret"] = np.log(datos["Close"] / datos["Close"].shift(1))
+    QLIKE se evalúa en varianza (RV²), que es su forma estándar. Es la única
+    de estas métricas que penaliza correctamente subestimar la volatilidad en
+    los episodios de estrés, que es cuando el error importa.
+    """
+    real = np.asarray(real, dtype=float)
+    pred = np.clip(np.asarray(pred, dtype=float), 1e-8, None)
 
-    datos["Vol_5d"] = datos["Log_Ret"].rolling(window=5).std()
-    datos["Vol_20d"] = datos["Log_Ret"].rolling(window=20).std()
-    datos["Vol_60d"] = datos["Log_Ret"].rolling(window=60).std()
+    err = real - pred
+    ape = np.abs(err) / np.abs(real)
+    var_real, var_pred = real ** 2, pred ** 2
 
-    datos["RSI"] = ta.momentum.RSIIndicator(datos["Close"], window=14).rsi()
-    # MACD y ATR se normalizan por el precio: en niveles crudos escalan con
-    # el indice y caen fuera del rango de entrenamiento en produccion.
-    datos["MACD"] = ta.trend.MACD(datos["Close"]).macd() / datos["Close"]
-    datos["ATR"] = ta.volatility.AverageTrueRange(
-        high=datos["High"],
-        low=datos["Low"],
-        close=datos["Close"],
-        window=14,
-    ).average_true_range() / datos["Close"]
-    datos["Momento"] = ta.momentum.ROCIndicator(datos["Close"], window=10).roc()
-    datos["Vol_Pct_Change"] = datos["Volume"].pct_change()
-    # Sustitutos estacionarios de los precios/volumen en niveles:
-    datos["Rango_Rel"] = (datos["High"] - datos["Low"]) / datos["Close"]
-    datos["Vol_Rel"] = datos["Volume"] / datos["Volume"].rolling(window=20).mean()
+    log_real, log_pred = np.log(real), np.log(pred)
+    ss_res = np.sum((log_real - log_pred) ** 2)
+    ss_tot = np.sum((log_real - log_real.mean()) ** 2)
 
-    # RV(t+5) = sqrt(suma de retornos al cuadrado de los 5 dias siguientes)
-    datos["Ret_Sq"] = datos["Log_Ret"] ** 2
-    datos["RV_5d"] = np.sqrt(datos["Ret_Sq"].rolling(window=5).sum())
-    datos["RV_22d"] = np.sqrt(datos["Ret_Sq"].rolling(window=22).sum())  # para HAR
-
-    # Target en logaritmo: simetriza la distribucion (RV tiene cola pesada)
-    # y hace que el error optimizado sea aproximadamente relativo.
-    datos["Target"] = np.log(datos["RV_5d"].shift(-5).clip(lower=1e-8))
-
-    datos = datos.drop(columns=["Ret_Sq"])  # RV_5d y RV_22d se conservan para benchmarks
-    datos = datos.replace([np.inf, -np.inf], np.nan).dropna()
-
-    return datos
+    return {
+        "RMSE": float(np.sqrt(np.mean(err ** 2))),
+        "MAE": float(np.mean(np.abs(err))),
+        "MAPE": float(np.mean(ape) * 100),
+        "MdAPE": float(np.median(ape) * 100),
+        "QLIKE": float(np.mean(np.log(var_pred) + var_real / var_pred)),
+        "R2_log": float(1 - ss_res / ss_tot),
+    }
 
 
-# ==========================================
-# 3. CREACION DE SECUENCIAS (TENSOR 3D)
-# ==========================================
-def crear_secuencias(X_data, y_data, ventana=60):
-    print(f"[*] Creando tensores de secuencias con ventana de {ventana} dias...")
-
-    if len(X_data) != len(y_data):
-        raise ValueError("X_data e y_data deben tener la misma cantidad de filas.")
-
-    X, y = [], []
-    for i in range(ventana, len(X_data)):
-        X.append(X_data[i - ventana : i])
-        y.append(y_data[i])
-
-    return np.asarray(X), np.asarray(y)
+def imprimir_tabla(titulo, resultados):
+    print(f"\n  {titulo}")
+    print("  " + "-" * 86)
+    print(f"  {'Modelo':<26}{'MAPE':>9}{'MdAPE':>9}{'RMSE':>11}{'MAE':>11}"
+          f"{'QLIKE':>11}{'R2_log':>9}")
+    print("  " + "-" * 86)
+    for nombre, m in resultados.items():
+        print(f"  {nombre:<26}{m['MAPE']:>8.1f}%{m['MdAPE']:>8.1f}%"
+              f"{m['RMSE']:>11.5f}{m['MAE']:>11.5f}{m['QLIKE']:>11.4f}"
+              f"{m['R2_log']:>9.3f}")
+    print("  " + "-" * 86)
 
 
 # ==========================================
-# 4. ARQUITECTURA Y ENTRENAMIENTO LSTM
+# 2. Componente lineal (HAR / HAR-X)
 # ==========================================
-def construir_y_entrenar_lstm(X_train, y_train, X_val, y_val):
-    print("[*] Construyendo y entrenando la red LSTM...")
+def ajustar_har(X, y):
+    """Mínimos cuadrados con intercepto. Devuelve el vector de coeficientes."""
+    A = np.column_stack([np.ones(len(X)), X])
+    coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+    return coef
 
-    n_pasos = X_train.shape[1]
-    n_caracteristicas = X_train.shape[2]
 
-    modelo = Sequential(
-        [
-            Input(shape=(n_pasos, n_caracteristicas)),
-            LSTM(64, activation="tanh", recurrent_dropout=0.2),
-            Dropout(0.2),
-            Dense(32, activation="relu"),
-            Dense(1, activation="linear"),
-        ]
-    )
+def predecir_har(coef, X):
+    return np.column_stack([np.ones(len(X)), X]) @ coef
 
-    # MAE sobre log(RV) escalado ~ optimizar el error relativo (afin al MAPE)
-    modelo.compile(optimizer="adam", loss="mae", metrics=["mse"])
 
-    early_stop = EarlyStopping(
-        monitor="val_loss",
-        patience=10,
-        restore_best_weights=True,
-    )
+def a_niveles(log_pred, sigma2=0.0):
+    """
+    Convierte una predicción en log a niveles de RV.
 
-    historial = modelo.fit(
-        X_train,
-        y_train,
-        epochs=50,
-        batch_size=32,
-        validation_data=(X_val, y_val),
-        callbacks=[early_stop],
-        verbose=1,
-    )
-
-    return modelo, historial
+    exp(mu) es la MEDIANA condicional, no la media: en logs el error es
+    simétrico, pero al exponenciar la distribución se sesga. Sumar sigma²/2
+    (corrección de Jensen) devuelve la media condicional, que es el estimador
+    insesgado en niveles.
+    """
+    return np.exp(log_pred + sigma2 / 2.0)
 
 
 # ==========================================
-# FLUJO PRINCIPAL (MAIN)
+# FLUJO PRINCIPAL
 # ==========================================
 if __name__ == "__main__":
-    np.random.seed(42)
-    tf.random.set_seed(42)
+    print("=" * 90)
+    print(" ENTRENAMIENTO — VOLATILIDAD S&P 500  |  HAR-X + LSTM residual")
+    print("=" * 90)
 
-    df_crudo = obtener_datos_sp500()
-    df_features = ingenieria_caracteristicas(df_crudo)
+    # ---------- Datos ----------
+    print(f"\n[1/6] Descargando y procesando datos desde {FECHA_INICIO}...")
+    df = cargar_dataset(FECHA_INICIO)
+    n = len(df)
+    print(f"      {n:,} días hábiles  ({df.index[0]:%Y-%m-%d} → {df.index[-1]:%Y-%m-%d})")
+    print(f"      {len(COLUMNAS_X)} variables | ventana {VENTANA} | horizonte {HORIZONTE} días")
 
-    # Solo variables estacionarias: los precios/volumen en niveles crudos
-    # rompen el escalado cuando el indice sube fuera del rango de train.
-    columnas_x = [
-        "Log_Ret",
-        "Vol_5d",
-        "Vol_20d",
-        "Vol_60d",
-        "RSI",
-        "MACD",
-        "ATR",
-        "Momento",
-        "Vol_Pct_Change",
-        "Rango_Rel",
-        "Vol_Rel",
-    ]
-    columna_y = "Target"
+    # ---------- Split temporal con purga ----------
+    i1, i2 = int(n * 0.70), int(n * 0.85)
+    filas_train = np.arange(VENTANA, i1 - HORIZONTE)
+    filas_val = np.arange(i1, i2 - HORIZONTE)
+    filas_test = np.arange(i2, n)
 
-    df_modelo = df_features[columnas_x + [columna_y, "RV_5d", "RV_22d"]]
+    print(f"\n[2/6] Split temporal (purga de {HORIZONTE} días en cada frontera):")
+    for nombre, filas in (("train", filas_train), ("val", filas_val), ("test", filas_test)):
+        print(f"      {nombre:<6} {len(filas):>6,} filas   "
+              f"{df.index[filas[0]]:%Y-%m-%d} → {df.index[filas[-1]]:%Y-%m-%d}")
+    print(f"      muestra efectiva de train (targets no solapados): "
+          f"~{len(filas_train) // HORIZONTE:,} observaciones")
 
-    ventana_dias = 60
-    horizonte = 5  # dias futuros que usa el target
-    split_index = int(len(df_modelo) * 0.8)
+    X_bruto = df[COLUMNAS_X].to_numpy()
+    X_har = df[COLUMNAS_HAR].to_numpy()
+    y_log = df["Target"].to_numpy()
+    rv_real = np.exp(y_log)
 
-    if split_index <= ventana_dias + horizonte or len(df_modelo) - split_index <= horizonte:
-        raise ValueError(
-            "No hay suficientes datos para entrenar y validar con la ventana elegida."
+    # ---------- Escalado (ajustado SOLO con train) ----------
+    scaler_x = StandardScaler().fit(X_bruto[filas_train])
+    X_esc = scaler_x.transform(X_bruto)
+
+    # ---------- HAR-X: componente lineal ----------
+    print("\n[3/6] Ajustando el componente lineal...")
+    coef_har = ajustar_har(X_har[filas_train][:, :3], y_log[filas_train])   # sin VIX
+    coef_harx = ajustar_har(X_har[filas_train], y_log[filas_train])         # con VIX
+    har_todo = predecir_har(coef_har, X_har[:, :3])
+    harx_todo = predecir_har(coef_harx, X_har)
+    print("      HAR-X: intercepto=" + f"{coef_harx[0]:+.4f}  " +
+          "  ".join(f"{c}={v:+.4f}" for c, v in zip(COLUMNAS_HAR, coef_harx[1:])))
+
+    # La red aprende el residual del HAR-X, estandarizado
+    residual = y_log - harx_todo
+    scaler_y = StandardScaler().fit(residual[filas_train].reshape(-1, 1))
+    resid_esc = scaler_y.transform(residual.reshape(-1, 1)).ravel()
+
+    # ---------- Tensores ----------
+    X_train, filas_train = construir_secuencias(X_esc, filas_train, VENTANA)
+    X_val, filas_val = construir_secuencias(X_esc, filas_val, VENTANA)
+    X_test, filas_test = construir_secuencias(X_esc, filas_test, VENTANA)
+    y_train, y_val = resid_esc[filas_train], resid_esc[filas_val]
+
+    # ---------- Entrenamiento multi-semilla ----------
+    print(f"\n[4/6] Entrenando {N_SEMILLAS} redes LSTM({UNIDADES_LSTM}) sobre el residual...")
+    redes, mape_semillas = [], []
+
+    for k in range(N_SEMILLAS):
+        red = construir_lstm(VENTANA, len(COLUMNAS_X), semilla=k,
+                             nombre=f"lstm_semilla_{k}")
+        red.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=EPOCAS, batch_size=BATCH, verbose=0,
+            callbacks=[
+                EarlyStopping(monitor="val_loss", patience=PACIENCIA,
+                              restore_best_weights=True),
+                ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                                  patience=6, min_lr=1e-5, verbose=0),
+            ],
         )
+        redes.append(red)
 
-    # Purga anti-leakage: los ultimos `horizonte` targets del train usan
-    # retornos que caen dentro del periodo de validacion, asi que se excluyen.
-    X_train_df = df_modelo.iloc[: split_index - horizonte][columnas_x]
-    y_train_df = df_modelo.iloc[: split_index - horizonte][[columna_y]]
+        r = scaler_y.inverse_transform(red.predict(X_val, verbose=0)).ravel()
+        m = metricas(rv_real[filas_val], a_niveles(harx_todo[filas_val] + r))
+        mape_semillas.append(m["MAPE"])
+        print(f"      semilla {k}:  MAPE(val) = {m['MAPE']:.1f}%   "
+              f"R²log = {m['R2_log']:.3f}")
 
-    # La validacion necesita los ultimos dias de entrenamiento como contexto.
-    X_val_df = df_modelo.iloc[split_index - ventana_dias :][columnas_x]
-    y_val_df = df_modelo.iloc[split_index - ventana_dias :][[columna_y]]
+    print(f"      dispersión entre semillas: {np.mean(mape_semillas):.1f}% "
+          f"± {np.std(mape_semillas):.1f} pp  →  se promedian en un ensamble")
 
-    print("[*] Escalando datos...")
-    # StandardScaler: robusto ante picos (un solo evento tipo COVID no
-    # comprime el resto de la muestra como ocurre con MinMax).
-    scaler_x = StandardScaler()
-    scaler_y = StandardScaler()
+    modelo = ensamblar(redes, VENTANA, len(COLUMNAS_X))
+    print(f"      parámetros entrenables por red: {n_parametros(redes[0]):,}")
 
-    X_train_scaled = scaler_x.fit_transform(X_train_df)
-    y_train_scaled = scaler_y.fit_transform(y_train_df).ravel()
+    # ---------- Corrección de Jensen, calibrada en validación ----------
+    def log_pred_lstm(X_seq, filas):
+        r = scaler_y.inverse_transform(modelo.predict(X_seq, verbose=0)).ravel()
+        return harx_todo[filas] + r
 
-    X_val_scaled = scaler_x.transform(X_val_df)
-    y_val_scaled = scaler_y.transform(y_val_df).ravel()
+    logp_val = log_pred_lstm(X_val, filas_val)
+    sigma2 = float(np.var(y_log[filas_val] - logp_val))
+    sigma2_har = float(np.var(y_log[filas_val] - har_todo[filas_val]))
+    sigma2_harx = float(np.var(y_log[filas_val] - harx_todo[filas_val]))
+    print(f"      sigma² del residual en validación: {sigma2:.4f} "
+          f"(corrección de Jensen ×{np.exp(sigma2 / 2):.3f})")
 
-    X_train, y_train = crear_secuencias(
-        X_train_scaled,
-        y_train_scaled,
-        ventana=ventana_dias,
-    )
-    X_val, y_val = crear_secuencias(
-        X_val_scaled,
-        y_val_scaled,
-        ventana=ventana_dias,
-    )
+    # ---------- Evaluación ----------
+    print("\n[5/6] Evaluando sobre el conjunto de test (nunca visto)...")
 
-    if X_train.size == 0 or X_val.size == 0:
-        raise ValueError("No hay suficientes secuencias para entrenar o validar.")
+    def comparativa(filas, X_seq):
+        real = rv_real[filas]
+        # Persistencia: la RV de la próxima semana será la de la semana pasada
+        naive = df["RV_5d"].to_numpy()[filas]
+        return {
+            "Persistencia (naive)": metricas(real, naive),
+            "HAR-RV": metricas(real, a_niveles(har_todo[filas], sigma2_har)),
+            "HAR-X (con VIX)": metricas(real, a_niveles(harx_todo[filas], sigma2_harx)),
+            "HAR-X + LSTM (final)": metricas(real, a_niveles(log_pred_lstm(X_seq, filas), sigma2)),
+            # Mismo modelo sin corrección de Jensen: es la mediana condicional
+            # y es lo que sirve la app. Se reporta porque el MAPE la prefiere
+            # y porque sigma² está calibrado en un régimen más volátil.
+            "HAR-X + LSTM (mediana)": metricas(real, a_niveles(log_pred_lstm(X_seq, filas))),
+        }
 
-    print(f"[*] Forma de X_train confirmada: {X_train.shape}")
-    print(f"[*] Forma de X_val confirmada: {X_val.shape}")
+    res_val = comparativa(filas_val, X_val)
+    res_test = comparativa(filas_test, X_test)
+    imprimir_tabla("VALIDACIÓN (usada para early stopping — optimista)", res_val)
+    imprimir_tabla("TEST (nunca visto — este es el número honesto)", res_test)
 
-    modelo, historial = construir_y_entrenar_lstm(X_train, y_train, X_val, y_val)
+    mejora = ((res_test["HAR-X (con VIX)"]["QLIKE"] - res_test["HAR-X + LSTM (final)"]["QLIKE"])
+              / abs(res_test["HAR-X (con VIX)"]["QLIKE"]) * 100)
+    print(f"\n  Aporte de la red sobre su propio baseline (QLIKE en test): {mejora:+.2f}%")
+    if mejora <= 0:
+        print("  ⚠️  La red NO está aportando sobre el HAR-X. Usa el HAR-X solo.")
 
-    # ==========================================
-    # BENCHMARKS: LSTM vs PERSISTENCIA vs HAR-RV
-    # ==========================================
-    print("\n[*] Evaluando benchmarks en validacion (niveles de RV)...")
+    # ---------- Diagnóstico del MAPE por régimen ----------
+    real_test = rv_real[filas_test]
+    pred_test = a_niveles(log_pred_lstm(X_test, filas_test), sigma2)
+    quintiles = np.quantile(real_test, [0.2, 0.4, 0.6, 0.8])
+    grupo = np.digitize(real_test, quintiles)
+    print("\n  MAPE por quintil de volatilidad realizada (test):")
+    etiquetas = ["Q1 (más calmado)", "Q2", "Q3", "Q4", "Q5 (más volátil)"]
+    for g, etq in enumerate(etiquetas):
+        sel = grupo == g
+        if sel.sum():
+            ape = np.abs(real_test[sel] - pred_test[sel]) / real_test[sel]
+            print(f"      {etq:<20} RV media={real_test[sel].mean():.4f}   "
+                  f"MAPE={ape.mean() * 100:5.1f}%   n={sel.sum()}")
+    print("      (el MAPE alto se concentra en los quintiles calmados: el "
+          "denominador es pequeño)")
 
-    # Reales y predicciones LSTM, desescalados y llevados de log a niveles
-    rv_real = np.exp(scaler_y.inverse_transform(y_val.reshape(-1, 1)).ravel())
-    rv_lstm = np.exp(scaler_y.inverse_transform(modelo.predict(X_val, verbose=0)).ravel())
+    # ---------- Persistencia de artefactos ----------
+    print("\n[6/6] Guardando artefactos...")
+    modelo.save(ARCHIVO_MODELO)
+    joblib.dump(scaler_x, ARCHIVO_SCALER_X)
+    joblib.dump(scaler_y, ARCHIVO_SCALER_Y)
 
-    # Filas absolutas de df_modelo a las que corresponde cada secuencia de validacion
-    n_val = len(y_val)
-    filas_val = np.arange(split_index, split_index + n_val)
+    config = {
+        "version": 2,
+        "fecha_entrenamiento": datetime.today().strftime("%Y-%m-%d"),
+        "fecha_inicio_datos": str(df.index[0].date()),
+        "fecha_fin_datos": str(df.index[-1].date()),
+        "ventana": VENTANA,
+        "horizonte": HORIZONTE,
+        "columnas_x": COLUMNAS_X,
+        "columnas_har": COLUMNAS_HAR,
+        "coef_harx": coef_harx.tolist(),
+        "coef_har": coef_har.tolist(),
+        "sigma2": sigma2,
+        "n_semillas": N_SEMILLAS,
+        "metricas_test": res_test,
+        "metricas_val": res_val,
+    }
+    ARCHIVO_CONFIG.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
-    # 1) Persistencia (naive): RV de la proxima semana = RV trailing actual
-    rv_naive = df_modelo["RV_5d"].to_numpy()[filas_val]
-
-    # 2) HAR-RV (log-log): regresion sobre RV diaria, semanal y mensual
-    eps = 1e-8
-    log_rv1 = np.log(np.abs(df_modelo["Log_Ret"].to_numpy()) + eps)
-    log_rv5 = np.log(df_modelo["RV_5d"].to_numpy() + eps)
-    log_rv22 = np.log(df_modelo["RV_22d"].to_numpy() + eps)
-    y_log = df_modelo[columna_y].to_numpy()
-
-    filas_train_har = np.arange(0, split_index - horizonte)
-    A_train = np.column_stack([
-        np.ones(len(filas_train_har)),
-        log_rv1[filas_train_har],
-        log_rv5[filas_train_har],
-        log_rv22[filas_train_har],
-    ])
-    coef_har, *_ = np.linalg.lstsq(A_train, y_log[filas_train_har], rcond=None)
-    A_val = np.column_stack([
-        np.ones(n_val),
-        log_rv1[filas_val],
-        log_rv5[filas_val],
-        log_rv22[filas_val],
-    ])
-    rv_har = np.exp(A_val @ coef_har)
-
-    def _reportar(nombre, real, pred):
-        err = real - pred
-        rmse = float(np.sqrt(np.mean(err ** 2)))
-        mae = float(np.mean(np.abs(err)))
-        mape = float(np.mean(np.abs(err) / np.abs(real)) * 100)
-        print(f"    {nombre:<24} RMSE={rmse:.5f}  MAE={mae:.5f}  MAPE={mape:5.1f}%")
-
-    print("=" * 62)
-    _reportar("LSTM", rv_real, rv_lstm)
-    _reportar("Persistencia (naive)", rv_real, rv_naive)
-    _reportar("HAR-RV (log-log)", rv_real, rv_har)
-    print("=" * 62)
-    print("    El LSTM debe batir a ambos benchmarks para validar la hipotesis.\n")
-
-    # Guardar siempre junto a este script, sin importar el cwd
-    carpeta = Path(__file__).resolve().parent
-    modelo.save(carpeta / "modelo_lstm_sp500_volatilidad.keras")
-    joblib.dump(scaler_x, carpeta / "scaler_x_sp500_volatilidad.pkl")
-    joblib.dump(scaler_y, carpeta / "scaler_y_sp500_volatilidad.pkl")
-    print(f"[*] Modelo y escaladores guardados correctamente en: {carpeta}")
+    for archivo in (ARCHIVO_MODELO, ARCHIVO_SCALER_X, ARCHIVO_SCALER_Y, ARCHIVO_CONFIG):
+        print(f"      {archivo.name}")
+    print("\n" + "=" * 90)
