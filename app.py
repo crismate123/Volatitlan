@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 # Pipeline de inferencia y descarga de datos (mismos módulos que el entrenamiento)
 from Prediccion import PredictorVolatilidad
 from Caracteristicas import descargar_datos
+from Benchmarks import predecir_egarch, predecir_garch, predecir_har_rv
 
 # ==========================================
 # 1. Configuración inicial de la página
@@ -386,6 +387,64 @@ def historial_semanal(n_semanas=26):
 
 
 # ==========================================
+# 3.8 Comparativa de modelos (Selección de modelos)
+# ==========================================
+COLORES_MODELOS = {
+    "LSTM": "#3B82F6",
+    "HAR-RV": "#34D399",
+    "GARCH(1,1)": "#FBBF24",
+    "EGARCH": "#C084FC",
+}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def comparativa_modelos(anios=2):
+    """
+    Evalúa la LSTM y los tres benchmarks econométricos sobre el mismo periodo
+    out-of-sample y el mismo objetivo: RV(t+1..t+5).
+
+    Se descarga el histórico completo (desde 1990) porque los GARCH y el
+    HAR-RV se estiman con TODA la muestra anterior al corte; evaluar un GARCH
+    ajustado con dos años de datos sería injusto con el benchmark.
+    """
+    df = descargar_datos()
+    feats = predictor.preparar(df)
+    corte = feats.index.max() - pd.Timedelta(days=int(anios * 365))
+
+    log_ret = np.log(df["Close"] / df["Close"].shift(1))
+    rv_5d = np.sqrt((log_ret ** 2).rolling(window=5).sum())
+    y = rv_5d.shift(-5).reindex(feats.index).to_numpy()
+
+    filas = [i for i in range(predictor.ventana, len(feats))
+             if feats.index[i] > corte and not np.isnan(y[i])]
+    if not filas:
+        raise ValueError("No hay suficientes datos para construir la comparativa.")
+
+    X_esc, harx = predictor.matrices(feats)
+    pred_lstm, filas_ok = predictor.predecir_en_filas(X_esc, harx, filas)
+    idx_eval = feats.index[filas_ok]
+
+    # Benchmarks: parámetros congelados en el corte, predicción posterior
+    har = predecir_har_rv(feats, corte)
+    garch = predecir_garch(log_ret, corte)
+    egarch = predecir_egarch(log_ret, corte)
+
+    res = pd.DataFrame(
+        {
+            "Real": pd.Series(y, index=feats.index).loc[idx_eval],
+            "LSTM": pred_lstm,
+            "HAR-RV": har.reindex(idx_eval),
+            "GARCH(1,1)": garch.reindex(idx_eval),
+            "EGARCH": egarch.reindex(idx_eval),
+        },
+        index=idx_eval,
+    ).dropna()
+
+    metricas = {m: _metricas(res["Real"], res[m]) for m in COLORES_MODELOS}
+    return res, metricas
+
+
+# ==========================================
 # 4. Construcción del Header
 # ==========================================
 st.markdown("""
@@ -401,7 +460,7 @@ st.markdown("""
 # ==========================================
 # 5. Creación de las Pestañas
 # ==========================================
-tab1, tab2, tab3 = st.tabs(["Pronóstico", "Dashboard", "Acerca del Autor"])
+tab1, tab2, tab3, tab4 = st.tabs(["Pronóstico", "Dashboard", "Selección de modelos", "Acerca del Autor"])
 
 # --- CONTENIDO PESTAÑA 1: PRONÓSTICO Y MÉTRICAS ---
 with tab1:
@@ -817,8 +876,215 @@ with tab2:
         fig_corr.update_yaxes(autorange="reversed")
         st.plotly_chart(fig_corr, use_container_width=True)
 
-# --- CONTENIDO PESTAÑA 3 ---
+# --- CONTENIDO PESTAÑA 3: SELECCIÓN DE MODELOS ---
 with tab3:
+    st.markdown("""
+        <h2>Selección de Modelos</h2>
+        <p style="color: #A0B2C6; font-size: 1.1rem;">Comparativa out-of-sample de la red LSTM frente a los modelos econométricos de referencia: HAR-RV, GARCH(1,1) y EGARCH. Todos pronostican el mismo objetivo — la volatilidad realizada de los próximos 5 días hábiles — con parámetros estimados únicamente con información anterior al periodo evaluado.</p>
+    """, unsafe_allow_html=True)
+
+    if not modelo_cargado:
+        st.error(f"⚠️ No se pudo cargar el modelo LSTM, la comparativa no está disponible. Detalle: {error_msg}")
+    else:
+        anios_eval = st.radio(
+            "Periodo de evaluación",
+            [1, 2, 3],
+            index=1,
+            horizontal=True,
+            format_func=lambda n: f"Último año" if n == 1 else f"Últimos {n} años",
+        )
+
+        try:
+            with st.spinner("Estimando HAR-RV, GARCH(1,1) y EGARCH, y reconstruyendo las predicciones de la LSTM..."):
+                df_comp, met_comp = comparativa_modelos(int(anios_eval))
+        except Exception as e:
+            st.warning(f"No fue posible construir la comparativa de modelos: {e}")
+        else:
+            modelos = list(COLORES_MODELOS)
+            ranking = sorted(modelos, key=lambda m: met_comp[m]["MAPE"])
+            mejor = ranking[0]
+
+            # ---------- Tarjetas: MAPE por modelo ----------
+            st.markdown("<p class='section-title'>Error porcentual medio (MAPE)</p>", unsafe_allow_html=True)
+            st.markdown(
+                f"<p class='section-caption'>Sobre {len(df_comp):,} pronósticos diarios "
+                f"{'del último año' if anios_eval == 1 else f'de los últimos {anios_eval} años'} "
+                f"({df_comp.index.min():%d/%m/%Y} — {df_comp.index.max():%d/%m/%Y}). "
+                f"Mejor modelo del periodo: <b>{mejor}</b>.</p>",
+                unsafe_allow_html=True,
+            )
+            cols_mape = st.columns(4)
+            for col, m in zip(cols_mape, modelos):
+                dif = met_comp[m]["MAPE"] - met_comp[mejor]["MAPE"]
+                col.metric(
+                    f"{'🏆 ' if m == mejor else ''}{m}",
+                    f"{met_comp[m]['MAPE']:.1f}%",
+                    delta=None if m == mejor else f"{dif:+.1f} pp vs. {mejor}",
+                    delta_color="inverse",
+                )
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # ---------- Barras: MAPE y MdAPE ----------
+            g1, g2 = st.columns([3, 2])
+            with g1:
+                fig_bar = go.Figure()
+                for metrica, opac in [("MAPE", 1.0), ("MdAPE", 0.55)]:
+                    fig_bar.add_trace(go.Bar(
+                        x=modelos,
+                        y=[met_comp[m][metrica] for m in modelos],
+                        name=f"{metrica} (%)",
+                        marker_color=[COLORES_MODELOS[m] for m in modelos],
+                        marker_line_width=0,
+                        opacity=opac,
+                        text=[f"{met_comp[m][metrica]:.1f}%" for m in modelos],
+                        textposition="outside",
+                        textfont=dict(color="white"),
+                    ))
+                estilo_grafica(fig_bar, "Error porcentual: media (MAPE) y mediana (MdAPE)", altura=380)
+                fig_bar.update_layout(barmode="group")
+                fig_bar.update_yaxes(ticksuffix="%", rangemode="tozero")
+                st.plotly_chart(fig_bar, use_container_width=True)
+            with g2:
+                # QLIKE: la pérdida canónica de la literatura de volatilidad
+                fig_ql = go.Figure(go.Bar(
+                    x=modelos,
+                    y=[met_comp[m]["QLIKE"] for m in modelos],
+                    marker_color=[COLORES_MODELOS[m] for m in modelos],
+                    marker_line_width=0,
+                    text=[f"{met_comp[m]['QLIKE']:.3f}" for m in modelos],
+                    textposition="outside",
+                    textfont=dict(color="white"),
+                ))
+                estilo_grafica(fig_ql, "QLIKE (pérdida robusta, menor = mejor)", altura=380)
+                fig_ql.update_layout(showlegend=False)
+                st.plotly_chart(fig_ql, use_container_width=True)
+
+            # ---------- Barras: RMSE y MAE ----------
+            fig_err = make_subplots(rows=1, cols=2, subplot_titles=("RMSE", "MAE"),
+                                    horizontal_spacing=0.08)
+            for j, metrica in enumerate(["RMSE", "MAE"], start=1):
+                fig_err.add_trace(go.Bar(
+                    x=modelos,
+                    y=[met_comp[m][metrica] for m in modelos],
+                    marker_color=[COLORES_MODELOS[m] for m in modelos],
+                    marker_line_width=0,
+                    text=[f"{met_comp[m][metrica]:.5f}" for m in modelos],
+                    textposition="outside",
+                    textfont=dict(color="white", size=10),
+                    showlegend=False,
+                ), row=1, col=j)
+            estilo_grafica(fig_err, "Errores absolutos sobre niveles de RV (menor = mejor)", altura=340)
+            fig_err.update_annotations(font_color="white")
+            fig_err.update_yaxes(tickformat=".4f", rangemode="tozero")
+            st.plotly_chart(fig_err, use_container_width=True)
+
+            st.markdown("<br><hr style='border-color: rgba(255,255,255,0.1);'><br>", unsafe_allow_html=True)
+
+            # ---------- Serie temporal: real vs. cada modelo ----------
+            st.markdown("<p class='section-title'>Pronósticos frente a la volatilidad observada</p>", unsafe_allow_html=True)
+            st.markdown("<p class='section-caption'>Cada curva es el pronóstico diario del modelo para la RV de los 5 días siguientes. Haz clic en la leyenda para aislar modelos.</p>", unsafe_allow_html=True)
+
+            fig_series = go.Figure()
+            fig_series.add_trace(go.Scatter(
+                x=df_comp.index, y=df_comp["Real"],
+                mode="lines", name="Volatilidad Realizada (Real)",
+                line=dict(color="#E2E8F0", width=2.2),
+            ))
+            for m in modelos:
+                fig_series.add_trace(go.Scatter(
+                    x=df_comp.index, y=df_comp[m],
+                    mode="lines", name=m,
+                    line=dict(color=COLORES_MODELOS[m], width=1.5),
+                    opacity=0.9,
+                ))
+            estilo_grafica(fig_series, "RV a 5 días: observada vs. pronosticada por cada modelo", altura=420)
+            fig_series.update_yaxes(tickformat=".4f")
+            st.plotly_chart(fig_series, use_container_width=True)
+
+            # ---------- MAPE móvil por modelo ----------
+            st.markdown("<p class='section-title'>Estabilidad del error en el tiempo</p>", unsafe_allow_html=True)
+            st.markdown("<p class='section-caption'>MAPE móvil de 63 sesiones (~un trimestre): revela si la ventaja de un modelo es estable o depende del régimen de volatilidad.</p>", unsafe_allow_html=True)
+
+            fig_movil = go.Figure()
+            for m in modelos:
+                ape_m = (df_comp["Real"] - df_comp[m]).abs() / df_comp["Real"] * 100
+                fig_movil.add_trace(go.Scatter(
+                    x=df_comp.index, y=ape_m.rolling(63, min_periods=21).mean(),
+                    mode="lines", name=m,
+                    line=dict(color=COLORES_MODELOS[m], width=2),
+                ))
+            estilo_grafica(fig_movil, "MAPE móvil (63 sesiones) por modelo", altura=380)
+            fig_movil.update_yaxes(ticksuffix="%", rangemode="tozero")
+            st.plotly_chart(fig_movil, use_container_width=True)
+
+            # ---------- Tabla completa de métricas ----------
+            st.markdown("<p class='section-title'>Resumen de métricas</p>", unsafe_allow_html=True)
+            tabla = pd.DataFrame(met_comp).T[["MAPE", "MdAPE", "RMSE", "MAE", "QLIKE"]]
+            tabla.index.name = "Modelo"
+            st.dataframe(
+                tabla.style.format({
+                    "MAPE": "{:.2f}%", "MdAPE": "{:.2f}%",
+                    "RMSE": "{:.5f}", "MAE": "{:.5f}", "QLIKE": "{:.4f}",
+                }).highlight_min(axis=0, props="color: #3B82F6; font-weight: bold;"),
+                use_container_width=True,
+            )
+            st.markdown(
+                "<p class='section-caption'>En todas las métricas, menor es mejor. MAPE/MdAPE miden el error "
+                "relativo (media y mediana), RMSE/MAE el error absoluto en niveles de RV, y QLIKE es la pérdida "
+                "estándar de la literatura de volatilidad: penaliza con más fuerza subestimar la volatilidad en "
+                "episodios de estrés, que es el error más costoso en la práctica.</p>",
+                unsafe_allow_html=True,
+            )
+
+            st.markdown("<br><hr style='border-color: rgba(255,255,255,0.1);'><br>", unsafe_allow_html=True)
+
+            # ---------- Fichas de los modelos comparados ----------
+            st.markdown("<p class='section-title'>Los contendientes</p>", unsafe_allow_html=True)
+            fm1, fm2, fm3, fm4 = st.columns(4, gap="medium")
+            with fm1:
+                st.markdown("""
+                    <div class="info-card">
+                        <h4>🧠 LSTM (HAR-X + residual)</h4>
+                        <p>Red recurrente que corrige el residual de un HAR-X con VIX. Ventanas de 22 días
+                        y 13 variables estacionarias. Es el modelo en producción de Volatitlán.</p>
+                    </div>
+                """, unsafe_allow_html=True)
+            with fm2:
+                st.markdown("""
+                    <div class="info-card">
+                        <h4>📏 HAR-RV — Corsi (2009)</h4>
+                        <p>Regresión lineal de la RV futura sobre sus componentes diario, semanal y mensual.
+                        Simple, robusto y notoriamente difícil de batir en horizontes cortos.</p>
+                    </div>
+                """, unsafe_allow_html=True)
+            with fm3:
+                st.markdown("""
+                    <div class="info-card">
+                        <h4>📈 GARCH(1,1) — Bollerslev (1986)</h4>
+                        <p>Varianza condicional con persistencia simétrica: el estándar econométrico
+                        durante décadas. La varianza semanal se agrega desde los pronósticos diarios.</p>
+                    </div>
+                """, unsafe_allow_html=True)
+            with fm4:
+                st.markdown("""
+                    <div class="info-card">
+                        <h4>⚖️ EGARCH(1,1) — Nelson (1991)</h4>
+                        <p>GARCH en logaritmos con término asimétrico: captura el efecto apalancamiento.
+                        Su pronóstico multi-paso se obtiene por simulación (1.000 trayectorias).</p>
+                    </div>
+                """, unsafe_allow_html=True)
+
+            st.markdown(
+                "<br><p class='section-caption'>⚖️ <b>Protocolo:</b> los parámetros de HAR-RV, GARCH y EGARCH se estiman "
+                "con todo el histórico disponible desde 1990 hasta el inicio del periodo de evaluación y quedan congelados; "
+                "después solo se filtran con la información de cada día. La LSTM también fue entrenada con datos anteriores "
+                "al periodo evaluado. Ningún modelo ve el futuro que se le pide pronosticar.</p>",
+                unsafe_allow_html=True,
+            )
+
+# --- CONTENIDO PESTAÑA 4 ---
+with tab4:
     st.markdown("<h2>Acerca del Autor</h2>", unsafe_allow_html=True)
 
     perfil_col, texto_col = st.columns([1, 2.4], gap="large")
