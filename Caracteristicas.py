@@ -168,6 +168,17 @@ def descargar_datos(fecha_inicio=FECHA_INICIO, fecha_fin=None, usar_respaldo=Tru
         df = pd.concat([previas, vivo]).sort_index()
         fuente = "mixto" if len(previas) else "yahoo"
 
+    # Autorrefresco del respaldo: cada descarga en vivo exitosa deja el
+    # archivo local al día, así el fallback nunca se queda semanas atrás.
+    # Es seguro por construcción: el frame fusionado (aún sin recortar al
+    # rango pedido) siempre es un superconjunto del respaldo existente.
+    if vivo is not None and usar_respaldo:
+        try:
+            if respaldo is None or df.index.max() > respaldo.index.max():
+                df.to_csv(ARCHIVO_RESPALDO)
+        except OSError:
+            pass  # disco de solo lectura (p. ej. algunos despliegues): no es fatal
+
     df = df.loc[(df.index >= ts_inicio) & (df.index < ts_fin)]
     if df.empty:
         raise ValueError(f"No hay datos disponibles entre {str_inicio} y {str_fin}.")
