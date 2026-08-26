@@ -612,18 +612,29 @@ with tab1:
         try:
             _datos = cargar_datos_dashboard()
             _ultimo = _datos.index.max()
-            _dias = (pd.Timestamp.today().normalize() - _ultimo.normalize()).days
+            # La antigüedad se mide en SESIONES, no en días naturales: un lunes
+            # con el cierre del viernes son tres días de calendario pero ninguna
+            # sesión perdida, y avisarlo sería una falsa alarma. En la nube el
+            # origen es siempre el respaldo (Yahoo bloquea esas IPs), así que lo
+            # que importa no es de dónde vienen los datos sino si están al día.
+            _sesiones = int(np.busday_count(
+                (_ultimo.normalize() + pd.Timedelta(days=1)).date(),
+                (pd.Timestamp.today().normalize() + pd.Timedelta(days=1)).date(),
+            ))
             _fuente = _datos.attrs.get("fuente", "yahoo")
-            if _fuente == "respaldo":
+            if _sesiones > 2:
                 st.warning(
-                    f"Yahoo Finance no respondió; se está usando la copia local del "
-                    f"histórico, con datos hasta el {_ultimo:%d/%m/%Y} ({_dias} días). "
-                    f"Los pronósticos no incorporan las sesiones más recientes."
+                    f"Los datos de mercado llegan hasta el {_ultimo:%d/%m/%Y}, "
+                    f"{_sesiones} sesiones por detrás del mercado. Los pronósticos "
+                    f"no incorporan las jornadas más recientes."
                 )
-            elif _dias > 5:
-                st.info(
-                    f"Último dato de mercado disponible: {_ultimo:%d/%m/%Y} "
-                    f"({_dias} días de antigüedad)."
+            elif _fuente == "respaldo":
+                st.markdown(
+                    f"<p class='section-caption'>Datos de mercado hasta el "
+                    f"{_ultimo:%d/%m/%Y}, servidos desde la copia versionada del "
+                    f"histórico, que se actualiza de forma automática tras cada "
+                    f"cierre de sesión.</p>",
+                    unsafe_allow_html=True,
                 )
         except Exception:
             pass  # el aviso es accesorio: nunca debe tumbar la página

@@ -1,0 +1,59 @@
+# Mantiene fresco `datos_respaldo.csv` en el repositorio.
+#
+# Por qué existe: Yahoo Finance rechaza las peticiones que llegan desde IPs de
+# centros de datos, así que la app desplegada en Streamlit Cloud NUNCA puede
+# descargar en vivo y siempre sirve el CSV versionado. Sin este flujo, esos
+# datos envejecen hasta que alguien ejecuta la app en su equipo y hace push a
+# mano. Con él, el respaldo se actualiza solo tras cada cierre de mercado.
+
+name: Actualizar respaldo de datos
+
+on:
+  schedule:
+    # 22:30 UTC de lunes a viernes: con holgura tras el cierre de NYSE
+    # (20:00 UTC en horario de verano, 21:00 UTC en invierno).
+    - cron: "30 22 * * 1-5"
+  workflow_dispatch:  # permite lanzarlo a mano desde la pestaña Actions
+
+permissions:
+  contents: write
+
+concurrency:
+  group: actualizar-datos
+  cancel-in-progress: false
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Solo lo que necesita la descarga. Instalar TensorFlow aquí tardaría
+      # varios minutos y no interviene en la generación del CSV.
+      - name: Instalar dependencias minimas
+        run: pip install "pandas>=2.2,<3" "numpy>=1.26,<3" "yfinance>=0.2"
+
+      - name: Descargar historico desde Yahoo
+        run: |
+          python - <<'PY'
+          from Caracteristicas import guardar_respaldo
+          df = guardar_respaldo()
+          print(f"{len(df):,} sesiones | {df.index.min():%Y-%m-%d} -> {df.index.max():%Y-%m-%d}")
+          PY
+
+      - name: Confirmar y subir si hay datos nuevos
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- datos_respaldo.csv; then
+            echo "El respaldo ya estaba al dia; no hay nada que confirmar."
+          else
+            git add datos_respaldo.csv
+            git commit -m "Datos de mercado actualizados automaticamente"
+            git push
+            echo "Respaldo actualizado y subido."
+          fi

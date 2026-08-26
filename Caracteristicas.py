@@ -187,17 +187,34 @@ def descargar_datos(fecha_inicio=FECHA_INICIO, fecha_fin=None, usar_respaldo=Tru
     return df
 
 
-def guardar_respaldo(fecha_inicio="2015-01-01", fecha_fin=None):
+def guardar_respaldo(fecha_inicio=FECHA_INICIO, fecha_fin=None):
     """
     Regenera el archivo de respaldo desde Yahoo.
 
-    Ejecutar desde una máquina con acceso (no desde el servidor de despliegue)
-    y versionar el resultado. Conviene actualizarlo cada vez que se reentrena.
+    Ejecutar desde una máquina o un runner con acceso a Yahoo (nunca desde el
+    servidor de despliegue, cuya IP está bloqueada) y versionar el resultado.
+
+    Arranca en FECHA_INICIO (1990) a propósito: la pestaña de selección de
+    modelos estima el GARCH y el HAR-RV con toda la muestra previa al corte, y
+    un respaldo recortado los dejaría en desventaja frente a la red.
     """
     df = _descargar_yahoo(
         pd.Timestamp(fecha_inicio).strftime("%Y-%m-%d"),
         pd.Timestamp(fecha_fin or datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d"),
     )
+
+    # Guarda contra descargas parciales: Yahoo a veces responde con un tramo
+    # corto en lugar de fallar. Sobrescribir con eso destruiría el histórico
+    # versionado, que es justo lo que la app en la nube necesita.
+    previo = _cargar_respaldo()
+    if previo is not None:
+        if len(df) < len(previo) * 0.99 or df.index.min() > previo.index.min():
+            raise ValueError(
+                f"Descarga sospechosa: {len(df)} filas desde {df.index.min():%Y-%m-%d} "
+                f"frente a las {len(previo)} desde {previo.index.min():%Y-%m-%d} ya "
+                f"guardadas. No se sobrescribe el respaldo."
+            )
+
     df.to_csv(ARCHIVO_RESPALDO)
     return df
 
