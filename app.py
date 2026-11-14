@@ -81,13 +81,13 @@ st.markdown("""
     .subtitle-text { font-size: 1rem; font-weight: 300; margin-top: 5px; color: #A0B2C6; }
     .header-logo { height: 64px; width: auto; max-width: 45%; object-fit: contain; display: block; }
 
-    /* Logo fijo en la esquina inferior izquierda, visible en todas las pestañas.
-       multiply funde el fondo claro del JPEG con el fondo de la página. */
-    .logo-esquina {
-        position: fixed; left: 18px; bottom: 18px; width: 58px; height: auto;
-        z-index: 1000; opacity: 0.85; mix-blend-mode: multiply; pointer-events: none;
+    /* Pie de página: búho a la izquierda y firma a la derecha, en la misma
+       línea, al final de la página (no flota sobre el contenido). */
+    .pie-pagina {
+        display: flex; justify-content: space-between; align-items: center;
+        margin-top: 2rem; padding: 0 2rem;
     }
-    @media (max-width: 640px) { .logo-esquina { width: 40px; left: 10px; bottom: 10px; } }
+    .logo-esquina { height: 48px; width: auto; }
 
     .stTabs [data-baseweb="tab-list"] { gap: 8px; }
     .stTabs [data-baseweb="tab"] { background-color: #0F253F !important; border-radius: 8px 8px 0px 0px !important; padding: 12px 30px !important; border: none !important; transition: all 0.3s ease; }
@@ -268,7 +268,7 @@ st.markdown("""
     .formula-lectura { color: #A0B2C6; font-size: 0.88rem; line-height: 1.6; margin: 0; }
     .fila-sep { border: 0; border-top: 1px solid rgba(255,255,255,0.08); margin: 0.55rem 0; }
 
-    .footer-signature { font-family: 'Great Vibes', cursive !important; font-size: 2.2rem; text-align: right; color: #64748B; margin-top: 2rem; padding-right: 2rem; }
+    .footer-signature { font-family: 'Great Vibes', cursive !important; font-size: 2.2rem; text-align: right; color: #64748B; margin: 0; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -658,7 +658,9 @@ def imagen_base64(nombre):
 # blanco) convertido a texto claro sobre fondo transparente y recortado, para
 # que se lea sobre el degradado azul del encabezado.
 _logo_header = imagen_base64("betitlan_header.png")
-_logo_esquina = imagen_base64("martingalo_negro.jpeg")
+# buho_pie.png es martingalo_negro.jpeg con fondo transparente y trazo en el
+# mismo gris (#64748B) que la firma del pie de página.
+_logo_esquina = imagen_base64("buho_pie.png")
 _html_logo_header = (
     f'<img class="header-logo" src="{_logo_header}" alt="Martingalo Lab por Materanda">'
     if _logo_header else ""
@@ -674,15 +676,13 @@ st.markdown(f"""
     </div>
 """, unsafe_allow_html=True)
 
-if _logo_esquina:
-    st.markdown(f'<img class="logo-esquina" src="{_logo_esquina}" alt="Martingalo">',
-                unsafe_allow_html=True)
 
 # ==========================================
 # 5. Creación de las Pestañas
 # ==========================================
-tab1, tab2, tab_var, tab3, tab4 = st.tabs([
-    "Pronóstico", "Dashboard", "Valor en riesgo (VaR)", "Selección de modelos", "Acerca del Autor",
+# Orden de las pestañas (la primera es la que se abre por defecto)
+tab_var, tab1, tab3, tab2, tab4 = st.tabs([
+    "Valor en riesgo (VaR)", "Pronóstico", "Selección de modelos", "Dashboard", "Acerca del Autor",
 ])
 
 # --- CONTENIDO PESTAÑA 1: PRONÓSTICO Y MÉTRICAS ---
@@ -1655,7 +1655,7 @@ with tab4:
     with texto_col:
         st.markdown("""
             <div class="autor-nombre">Cristian A. Materanda</div>
-            <div class="autor-rol">Matemático, lógico estadístico, científico de datos</div>
+            <div class="autor-rol">Matemático · Lógico Estadístico · Científico de Datos</div>
             <p class="autor-bio">
                 Mi labor profesional es presentar información estratégica obtenida a partir del
                 análisis de datos, la modelación estadística y el machine learning, con el objetivo
@@ -1740,4 +1740,10 @@ with tab4:
 # ==========================================
 # 6. Footer
 # ==========================================
-st.markdown('<div class="footer-signature">Martingale Lab</div>', unsafe_allow_html=True)
+_html_buho = (
+    f'<img class="logo-esquina" src="{_logo_esquina}" alt="Martingalo">' if _logo_esquina else "<span></span>"
+)
+st.markdown(
+    f'<div class="pie-pagina">{_html_buho}<div class="footer-signature">Martingale Lab</div></div>',
+    unsafe_allow_html=True,
+)
