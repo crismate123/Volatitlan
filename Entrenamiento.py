@@ -38,7 +38,9 @@ from sklearn.preprocessing import StandardScaler
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
 from Caracteristicas import (
+    COLUMNAS_EVENTOS,
     COLUMNAS_HAR,
+    COLUMNAS_HAR_BASE,
     COLUMNAS_X,
     FECHA_INICIO,
     HORIZONTE,
@@ -172,11 +174,22 @@ if __name__ == "__main__":
     # ---------- HAR-X: componente lineal ----------
     print("\n[3/6] Ajustando el componente lineal...")
     coef_har = ajustar_har(X_har[filas_train][:, :3], y_log[filas_train])   # sin VIX
-    coef_harx = ajustar_har(X_har[filas_train], y_log[filas_train])         # con VIX
+    coef_harx = ajustar_har(X_har[filas_train], y_log[filas_train])         # con VIX, plazos y eventos
+    # HAR-X original (solo RV + VIX): referencia para medir el aporte de los
+    # plazos y del calendario de eventos.
+    X_har_base = df[COLUMNAS_HAR_BASE].to_numpy()
+    coef_harx_base = ajustar_har(X_har_base[filas_train], y_log[filas_train])
     har_todo = predecir_har(coef_har, X_har[:, :3])
     harx_todo = predecir_har(coef_harx, X_har)
-    print("      HAR-X: intercepto=" + f"{coef_harx[0]:+.4f}  " +
-          "  ".join(f"{c}={v:+.4f}" for c, v in zip(COLUMNAS_HAR, coef_harx[1:])))
+    harx_base_todo = predecir_har(coef_harx_base, X_har_base)
+    print("      HAR-X: intercepto=" + f"{coef_harx[0]:+.4f}")
+    for c, v in zip(COLUMNAS_HAR, coef_harx[1:]):
+        extra = ""
+        if c in COLUMNAS_EVENTOS:
+            n_ev = int(df[c].to_numpy()[filas_train].sum())
+            # Un indicador en un modelo en logs: exp(b)-1 es el cambio % en la RV
+            extra = f"   → RV {np.expm1(v) * 100:+.1f}% en semanas con evento (n={n_ev} filas en train)"
+        print(f"        {c:<16}{v:+.4f}{extra}")
 
     # La red aprende el residual del HAR-X, estandarizado
     residual = y_log - harx_todo
@@ -230,6 +243,7 @@ if __name__ == "__main__":
     sigma2 = float(np.var(y_log[filas_val] - logp_val))
     sigma2_har = float(np.var(y_log[filas_val] - har_todo[filas_val]))
     sigma2_harx = float(np.var(y_log[filas_val] - harx_todo[filas_val]))
+    sigma2_harx_base = float(np.var(y_log[filas_val] - harx_base_todo[filas_val]))
     print(f"      sigma² del residual en validación: {sigma2:.4f} "
           f"(corrección de Jensen ×{np.exp(sigma2 / 2):.3f})")
 
@@ -243,6 +257,7 @@ if __name__ == "__main__":
         return {
             "Persistencia (naive)": metricas(real, naive),
             "HAR-RV": metricas(real, a_niveles(har_todo[filas], sigma2_har)),
+            "HAR-X base (solo VIX)": metricas(real, a_niveles(harx_base_todo[filas], sigma2_harx_base)),
             "HAR-X (con VIX)": metricas(real, a_niveles(harx_todo[filas], sigma2_harx)),
             "HAR-X + LSTM (final)": metricas(real, a_niveles(log_pred_lstm(X_seq, filas), sigma2)),
             # Mismo modelo sin corrección de Jensen: es la mediana condicional
@@ -256,11 +271,44 @@ if __name__ == "__main__":
     imprimir_tabla("VALIDACIÓN (usada para early stopping — optimista)", res_val)
     imprimir_tabla("TEST (nunca visto — este es el número honesto)", res_test)
 
-    mejora = ((res_test["HAR-X (con VIX)"]["QLIKE"] - res_test["HAR-X + LSTM (final)"]["QLIKE"])
-              / abs(res_test["HAR-X (con VIX)"]["QLIKE"]) * 100)
-    print(f"\n  Aporte de la red sobre su propio baseline (QLIKE en test): {mejora:+.2f}%")
+    def aporte(res, base, nuevo):
+        return (res[base]["QLIKE"] - res[nuevo]["QLIKE"]) / abs(res[base]["QLIKE"]) * 100
+
+    mejora_ev = aporte(res_test, "HAR-X base (solo VIX)", "HAR-X (con VIX)")
+    print(f"\n  Aporte de plazos + eventos sobre el HAR-X base (QLIKE en test): {mejora_ev:+.2f}%")
+    mejora = aporte(res_test, "HAR-X (con VIX)", "HAR-X + LSTM (final)")
+    print(f"  Aporte de la red sobre su propio baseline (QLIKE en test): {mejora:+.2f}%")
     if mejora <= 0:
         print("  ⚠️  La red NO está aportando sobre el HAR-X. Usa el HAR-X solo.")
+
+    # ---------- Semanas con evento programado ----------
+    # La mejora por eventos se diluye en el promedio global (son pocas
+    # semanas), así que se mide aparte: test + validación para tener más casos.
+    print("\n  Semanas con evento programado en la ventana (validación + test):")
+    filas_ev_todas = np.concatenate([filas_val, filas_test])
+    metricas_eventos = {}
+    grupos = {c: df[c].to_numpy()[filas_ev_todas] > 0 for c in COLUMNAS_EVENTOS}
+    grupos["Sin evento"] = ~np.any(np.column_stack(list(grupos.values())), axis=1)
+    print(f"      {'Grupo':<16}{'n':>6}{'MAPE base':>12}{'MAPE nuevo':>12}"
+          f"{'QLIKE base':>12}{'QLIKE nuevo':>13}{'Sesgo base':>12}{'Sesgo nuevo':>13}")
+    for nombre, sel in grupos.items():
+        if sel.sum() < 3:
+            print(f"      {nombre:<16}{int(sel.sum()):>6}   (muy pocas filas)")
+            continue
+        f = filas_ev_todas[sel]
+        real = rv_real[f]
+        pb = a_niveles(harx_base_todo[f])
+        pn = a_niveles(harx_todo[f])
+        mb, mn = metricas(real, pb), metricas(real, pn)
+        # Sesgo mediano en log: < 0 significa que el modelo SUBESTIMA
+        sb = float(np.median(np.log(pb / real)) * 100)
+        sn = float(np.median(np.log(pn / real)) * 100)
+        metricas_eventos[nombre] = {"n": int(sel.sum()), "base": mb, "nuevo": mn,
+                                    "sesgo_base_pct": sb, "sesgo_nuevo_pct": sn}
+        print(f"      {nombre:<16}{int(sel.sum()):>6}{mb['MAPE']:>11.1f}%{mn['MAPE']:>11.1f}%"
+              f"{mb['QLIKE']:>12.4f}{mn['QLIKE']:>13.4f}{sb:>11.1f}%{sn:>12.1f}%")
+    print("      (base = HAR-X solo VIX; nuevo = HAR-X con plazos y eventos; ambos mediana,"
+          " sin la red, para aislar el efecto de las variables nuevas)")
 
     # ---------- Diagnóstico del MAPE por régimen ----------
     real_test = rv_real[filas_test]
@@ -285,20 +333,27 @@ if __name__ == "__main__":
     joblib.dump(scaler_y, ARCHIVO_SCALER_Y)
 
     config = {
-        "version": 2,
+        "version": 3,
         "fecha_entrenamiento": datetime.today().strftime("%Y-%m-%d"),
         "fecha_inicio_datos": str(df.index[0].date()),
         "fecha_fin_datos": str(df.index[-1].date()),
+        # Último día de train: el VaR (Riesgo.py) calibra sus residuales solo
+        # con días posteriores, que el modelo no vio al entrenar.
+        "fecha_fin_train": str(df.index[filas_train[-1]].date()),
         "ventana": VENTANA,
         "horizonte": HORIZONTE,
         "columnas_x": COLUMNAS_X,
         "columnas_har": COLUMNAS_HAR,
         "coef_harx": coef_harx.tolist(),
         "coef_har": coef_har.tolist(),
+        "columnas_har_base": COLUMNAS_HAR_BASE,
+        "coef_harx_base": coef_harx_base.tolist(),
+        "columnas_eventos": COLUMNAS_EVENTOS,
         "sigma2": sigma2,
         "n_semillas": N_SEMILLAS,
         "metricas_test": res_test,
         "metricas_val": res_val,
+        "metricas_eventos": metricas_eventos,
     }
     ARCHIVO_CONFIG.write_text(json.dumps(config, indent=2), encoding="utf-8")
 

@@ -32,6 +32,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from Eventos import COLUMNAS_EVENTOS, variables_eventos
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 _CARPETA = Path(__file__).resolve().parent
@@ -69,10 +71,39 @@ COLUMNAS_X = [
     "log_VIX",
     "VIX_Chg",
     "IV_RV_Spread",
+    "Pend_9D",
+    "Pend_3M",
+    "Falta_9D",
+    "Falta_3M",
 ]
 
-# Regresores del HAR-X (componente lineal que la red solo corrige)
-COLUMNAS_HAR = ["log_RV_1d", "log_RV_5d", "log_RV_22d", "log_VIX"]
+# Regresores del HAR-X original (se conserva como referencia en la evaluación)
+COLUMNAS_HAR_BASE = ["log_RV_1d", "log_RV_5d", "log_RV_22d", "log_VIX"]
+
+# Regresores del HAR-X (componente lineal que la red solo corrige).
+# Las variables de evento van AQUÍ y no en la red: un coeficiente lineal por
+# tipo de evento es estimable e interpretable, y la red solo ve las filas
+# t-22..t-1, no la fila t (que es la que lleva la ventana del evento).
+#
+# Las elecciones NO entran (sí se calculan, para medir el error en esas
+# semanas): con ~13 elecciones en train su coeficiente es ruido. En la
+# prueba de variantes, el indicador de intermedias salió NEGATIVO (-13%) y
+# empeoró el QLIKE; un indicador conjunto quedó en ~0. La señal de un evento
+# electoral que el mercado sí anticipa entra por Pend_9D.
+#
+# Falta_9D/Falta_3M son necesarias: sin ellas, rellenar con 0 la pendiente
+# antes de 2011 (cuando su media real es ~-0.05) sesgaba el pronóstico a la
+# baja en test (sesgo mediano -9.7% frente a -4.6%).
+COLUMNAS_HAR = COLUMNAS_HAR_BASE + ["Pend_9D", "Pend_3M", "Falta_9D", "Falta_3M", "Ev_FOMC"]
+
+# Índices de plazo de la volatilidad implícita (opcionales: si Yahoo no los
+# devuelve, el modelo usa pendiente 0, que equivale a "curva plana").
+TICKERS_PLAZOS = {"VIX9D": "^VIX9D", "VIX3M": "^VIX3M"}
+
+# Series opcionales que se descargan junto al índice. USDMXN (pesos por
+# dólar) no entra al modelo: lo usa la pestaña de VaR para medir el riesgo de
+# un inversionista en pesos sin cobertura cambiaria.
+TICKERS_OPCIONALES = {**TICKERS_PLAZOS, "USDMXN": "MXN=X"}
 
 # Columnas auxiliares necesarias para benchmarks y para el target
 COLUMNAS_AUX = ["Log_Ret", "RV_5d", "RV_22d"]
@@ -115,6 +146,15 @@ def _descargar_yahoo(str_inicio, str_fin):
     # ffill corto: cubre feriados desalineados entre ambos índices sin
     # inventar datos en huecos largos.
     df["VIX"] = vix["Close"].reindex(df.index).ffill(limit=5)
+
+    # Plazos de la volatilidad implícita y tipo de cambio: no son críticos.
+    # Un fallo aquí no debe tumbar la descarga del índice y del VIX.
+    for columna, ticker in TICKERS_OPCIONALES.items():
+        try:
+            serie = _bajar(ticker, str_inicio, str_fin)["Close"]
+            df[columna] = serie.reindex(df.index).ffill(limit=5)
+        except Exception:
+            df[columna] = np.nan
     return df.dropna(subset=["VIX"])
 
 
@@ -279,7 +319,28 @@ def ingenieria_caracteristicas(df, con_target=True):
     rv22_anual = d["RV_22d"] * np.sqrt(252.0 / 22.0)
     d["IV_RV_Spread"] = d["log_VIX"] - np.log(rv22_anual + _EPS)
 
-    columnas = COLUMNAS_X + COLUMNAS_AUX + ["RV_66d"]
+    # --- Estructura de plazos de la volatilidad implícita --------------
+    # Pend_9D > 0: el mercado paga más volatilidad a 9 días que a 30, señal
+    # de un evento concentrado en los próximos días (justo el horizonte del
+    # target). El VIX solo diluye ese evento entre ~21 sesiones.
+    # Pend_3M > 0: curva invertida, típica de estrés.
+    # Sin dato (VIX9D existe desde 2011, VIX3M desde ~2007, o falla la
+    # descarga) la pendiente vale 0: "curva plana", sin información extra.
+    for col in TICKERS_PLAZOS:
+        if col not in d.columns:
+            d[col] = np.nan
+    d["Falta_9D"] = d["VIX9D"].isna().astype(float)
+    d["Falta_3M"] = d["VIX3M"].isna().astype(float)
+    d["Pend_9D"] = np.log(d["VIX9D"] / d["VIX"]).fillna(0.0)
+    d["Pend_3M"] = np.log(d["VIX"] / d["VIX3M"]).fillna(0.0)
+
+    # --- Eventos programados en la ventana del target -------------------
+    ev = variables_eventos(d.index, horizonte=HORIZONTE)
+    for col in COLUMNAS_EVENTOS:
+        d[col] = ev[col].to_numpy()
+
+    columnas = list(dict.fromkeys(
+        COLUMNAS_X + COLUMNAS_HAR + COLUMNAS_EVENTOS + COLUMNAS_AUX + ["RV_66d"]))
 
     if con_target:
         # RV(t+1..t+5): lo que se quiere pronosticar. En log, porque la RV
