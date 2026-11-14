@@ -2,6 +2,21 @@
   "version": "0.0.1",
   "configurations": [
     {
+      "name": "volatitlan-venv",
+      "runtimeExecutable": "C:\\Users\\cm180\\.vt\\Scripts\\python.exe",
+      "runtimeArgs": [
+        "-m",
+        "streamlit",
+        "run",
+        "app.py",
+        "--server.port",
+        "8503",
+        "--server.headless",
+        "true"
+      ],
+      "port": 8503
+    },
+    {
       "name": "volatitlan",
       "runtimeExecutable": "py",
       "runtimeArgs": [
@@ -15,6 +30,21 @@
         "true"
       ],
       "port": 8501
+    },
+    {
+      "name": "volatitlan2",
+      "runtimeExecutable": "py",
+      "runtimeArgs": [
+        "-m",
+        "streamlit",
+        "run",
+        "C:\\Users\\cm180\\OneDrive\\Martingalo\\Volatitlan2\\app.py",
+        "--server.port",
+        "8502",
+        "--server.headless",
+        "true"
+      ],
+      "port": 8502
     }
   ]
 }

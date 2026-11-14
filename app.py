@@ -1,3 +1,5 @@
+import base64
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,6 +14,16 @@ _CARPETA_APP = Path(__file__).resolve().parent
 from Prediccion import PredictorVolatilidad
 from Caracteristicas import descargar_datos
 from Benchmarks import predecir_egarch, predecir_garch, predecir_har_rv
+from Riesgo import (
+    alinear_tipo_cambio,
+    backtest_semanal,
+    prueba_kupiec,
+    residuales_estandarizados,
+    retorno_adelantado,
+    volatilidad_combinada,
+    var_cvar_fhs,
+    var_cvar_normal,
+)
 
 # ==========================================
 # 1. Configuración inicial de la página
@@ -67,7 +79,15 @@ st.markdown("""
     .header-titles { display: flex; flex-direction: column; }
     .title-text { font-size: 1.8rem; font-weight: 700; margin: 0; letter-spacing: 2px; text-transform: uppercase; }
     .subtitle-text { font-size: 1rem; font-weight: 300; margin-top: 5px; color: #A0B2C6; }
-    .author-signature { font-family: 'Great Vibes', cursive !important; font-size: 2.5rem; margin: 0; color: #E2E8F0; text-shadow: 1px 1px 2px rgba(0,0,0,0.2); }
+    .header-logo { height: 64px; width: auto; max-width: 45%; object-fit: contain; display: block; }
+
+    /* Logo fijo en la esquina inferior izquierda, visible en todas las pestañas.
+       multiply funde el fondo claro del JPEG con el fondo de la página. */
+    .logo-esquina {
+        position: fixed; left: 18px; bottom: 18px; width: 58px; height: auto;
+        z-index: 1000; opacity: 0.85; mix-blend-mode: multiply; pointer-events: none;
+    }
+    @media (max-width: 640px) { .logo-esquina { width: 40px; left: 10px; bottom: 10px; } }
 
     .stTabs [data-baseweb="tab-list"] { gap: 8px; }
     .stTabs [data-baseweb="tab"] { background-color: #0F253F !important; border-radius: 8px 8px 0px 0px !important; padding: 12px 30px !important; border: none !important; transition: all 0.3s ease; }
@@ -144,6 +164,12 @@ st.markdown("""
 
     /* Selector de semana (selectbox) sobre fondo oscuro */
     .stSelectbox [data-testid="stWidgetLabel"] p { color: #A0B2C6 !important; }
+
+    /* Controles de la pestaña de VaR (monto y confianza) sobre fondo oscuro */
+    .stNumberInput [data-testid="stWidgetLabel"] p,
+    .stSlider [data-testid="stWidgetLabel"] p { color: #A0B2C6 !important; }
+    .stSlider [data-testid="stTickBarMin"], .stSlider [data-testid="stTickBarMax"] { color: #A0B2C6 !important; }
+    .stCheckbox label p, .stToggle label p { color: #E2E8F0 !important; }
 
     /* ---------- Pestaña: Acerca del Autor ---------- */
     .autor-nombre {
@@ -578,22 +604,86 @@ def comparativa_modelos(anios=2):
 
 
 # ==========================================
+# 3.9 Valor en riesgo (VaR / CVaR)
+# ==========================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def datos_riesgo():
+    """
+    Pronóstico del modelo para cada día posterior al entrenamiento, junto con
+    el retorno observado de las 5 sesiones siguientes y el cierre diario.
+
+    Es la materia prima del VaR por simulación histórica filtrada (ver
+    `Riesgo.py`). La última fila es el pronóstico vigente: su retorno futuro
+    todavía no existe.
+    """
+    df = datos_mercado()
+    feats = predictor.preparar(df)
+    X_esc, harx = predictor.matrices(feats)
+    inicio = pd.Timestamp(predictor.config.get("fecha_fin_train", "2015-10-27"))
+    filas = [i for i in range(predictor.ventana, len(feats)) if feats.index[i] > inicio]
+    pred, filas_ok = predictor.predecir_en_filas(X_esc, harx, filas)
+    idx = feats.index[filas_ok]
+    # El retorno adelantado se calcula sobre el índice completo de sesiones
+    # (no sobre `feats`, que podría tener huecos) y luego se alinea.
+    ret = retorno_adelantado(df["Close"], predictor.horizonte).reindex(idx)
+    res = pd.DataFrame({"Pronostico": pred, "Ret5": ret.to_numpy()}, index=idx)
+
+    # Inversionista en pesos: retorno del índice + retorno de USD/MXN, con su
+    # volatilidad combinada. Si el tipo de cambio no se pudo descargar, las
+    # columnas quedan vacías y la pestaña ofrece solo la vista cubierta.
+    fx = df["USDMXN"] if "USDMXN" in df.columns else pd.Series(np.nan, index=df.index)
+    fx = alinear_tipo_cambio(fx)
+    ret_fx = retorno_adelantado(fx, predictor.horizonte).reindex(idx)
+    res["Ret5_fx"] = ret_fx.to_numpy()
+    res["Ret5_mxn"] = res["Ret5"] + res["Ret5_fx"]
+    comb = volatilidad_combinada(res["Pronostico"], df["Close"], fx, predictor.horizonte)
+    res = res.join(comb)
+    return res, df["Close"], fx
+
+
+# ==========================================
 # 4. Construcción del Header
 # ==========================================
-st.markdown("""
+@st.cache_data(show_spinner=False)
+def imagen_base64(nombre):
+    """Imagen de `assets/` como data URI, para incrustarla en HTML propio."""
+    ruta = _CARPETA_APP / "assets" / nombre
+    if not ruta.exists():
+        return ""
+    tipo = "png" if ruta.suffix.lower() == ".png" else "jpeg"
+    return f"data:image/{tipo};base64,{base64.b64encode(ruta.read_bytes()).decode()}"
+
+
+# betitlan_header.png es betitlan.png (texto blanco con sombra sobre fondo
+# blanco) convertido a texto claro sobre fondo transparente y recortado, para
+# que se lea sobre el degradado azul del encabezado.
+_logo_header = imagen_base64("betitlan_header.png")
+_logo_esquina = imagen_base64("martingalo_negro.jpeg")
+_html_logo_header = (
+    f'<img class="header-logo" src="{_logo_header}" alt="Martingalo Lab por Materanda">'
+    if _logo_header else ""
+)
+
+st.markdown(f"""
     <div class="top-header">
         <div class="header-titles">
             <div class="title-text">Volatitlán</div>
             <div class="subtitle-text">Pronóstico de volatilidades</div>
         </div>
-        <div class="author-signature">Por Materanda</div>
+        {_html_logo_header}
     </div>
 """, unsafe_allow_html=True)
+
+if _logo_esquina:
+    st.markdown(f'<img class="logo-esquina" src="{_logo_esquina}" alt="Martingalo">',
+                unsafe_allow_html=True)
 
 # ==========================================
 # 5. Creación de las Pestañas
 # ==========================================
-tab1, tab2, tab3, tab4 = st.tabs(["Pronóstico", "Dashboard", "Selección de modelos", "Acerca del Autor"])
+tab1, tab2, tab_var, tab3, tab4 = st.tabs([
+    "Pronóstico", "Dashboard", "Valor en riesgo (VaR)", "Selección de modelos", "Acerca del Autor",
+])
 
 # --- CONTENIDO PESTAÑA 1: PRONÓSTICO Y MÉTRICAS ---
 with tab1:
@@ -1006,6 +1096,292 @@ with tab2:
         fig_corr.update_yaxes(autorange="reversed")
         st.plotly_chart(fig_corr, use_container_width=True)
 
+# --- CONTENIDO PESTAÑA: VALOR EN RIESGO ---
+with tab_var:
+    st.markdown("""
+        <h2>Valor en riesgo (VaR)</h2>
+        <p style="color: #A0B2C6; font-size: 1.1rem;">Cuánto podrías perder en una semana invirtiendo en el S&P 500, usando como insumo el pronóstico de volatilidad del modelo.</p>
+    """, unsafe_allow_html=True)
+
+    if not modelo_cargado:
+        st.error(f"No se pudo cargar el modelo, el VaR no está disponible. Detalle: {error_msg}")
+    else:
+        try:
+            with st.spinner("Calculando el riesgo con el pronóstico del modelo..."):
+                riesgo, cierres, tipo_cambio = datos_riesgo()
+
+            hay_fx = bool(riesgo["sigma_mxn"].notna().any()) and pd.notna(tipo_cambio.iloc[-1])
+            con_fx = st.toggle(
+                "Incluir el riesgo del tipo de cambio USD/MXN (inversión en pesos sin cobertura)",
+                value=hay_fx, disabled=not hay_fx,
+            )
+            if not hay_fx:
+                st.info("No hay datos del tipo de cambio USD/MXN disponibles: se muestra solo el riesgo del índice.")
+
+            # Columnas según la moneda: el S&P solo (cubierto) o S&P + USD/MXN
+            col_sigma = "sigma_mxn" if con_fx else "Pronostico"
+            col_ret = "Ret5_mxn" if con_fx else "Ret5"
+
+            def factor(serie, desde):
+                """Valor relativo de la serie respecto a la fecha `desde`."""
+                return serie / serie.loc[desde]
+
+            c_monto, c_conf = st.columns([1, 2])
+            monto = c_monto.number_input(
+                "Monto invertido (MXN)", min_value=1.0, value=100.0, step=50.0, format="%.2f",
+            )
+            nivel = c_conf.select_slider(
+                "Nivel de confianza",
+                options=[0.90, 0.95, 0.975, 0.99],
+                value=0.95,
+                format_func=lambda a: f"{a * 100:g}%",
+            )
+            p_cola = 1.0 - nivel
+
+            def mxn(x):
+                return f"${x:,.2f} MXN"
+
+            def pesos(x):
+                """Formato corto para las tarjetas: el sufijo MXN no cabe."""
+                return f"${x:,.2f}"
+
+            z_todos = residuales_estandarizados(riesgo[col_sigma], riesgo[col_ret])
+
+            # ---------- Semana en curso ----------
+            ultimo = cierres.index.max()
+            lunes = (ultimo - pd.Timedelta(days=int(ultimo.weekday()))).normalize()
+            base = cierres.index[cierres.index < lunes].max()      # cierre previo a la semana
+            sesiones = int((cierres.index >= lunes).sum())
+            hoy = pd.Timestamp.today().normalize()
+            cerrada = ultimo.weekday() == 4 or hoy > lunes + pd.Timedelta(days=4)
+
+            sigma_sem = float(riesgo[col_sigma].loc[:base].iloc[-1])
+            z_sem = z_todos[z_todos.index <= base - pd.Timedelta(days=10)]
+            r_sem = var_cvar_fhs(z_sem, sigma_sem, nivel, monto)
+
+            semana = cierres[cierres.index >= base]
+            f_sp = factor(semana, base)
+            f_fx = factor(tipo_cambio[tipo_cambio.index >= base], base) if con_fx else 1.0
+            valor = monto * f_sp * f_fx
+            pyg_sem = float(valor.iloc[-1] - monto)
+            excede = -pyg_sem > r_sem["VaR"]
+
+            titulo_sem = "Semana actual (cerrada)" if cerrada else f"Semana en curso ({sesiones} de 5 sesiones)"
+            st.markdown(f"<p class='section-title'>{titulo_sem}</p>", unsafe_allow_html=True)
+            st.markdown(
+                f"<p class='section-caption'>Si hubieras invertido <b>{mxn(monto)}</b> al cierre del "
+                f"{base:%d/%m/%Y} (viernes previo), así va tu inversión al cierre del {ultimo:%d/%m/%Y}. "
+                f"El VaR y el CVaR son los que el modelo habría calculado ese viernes, antes de que empezara la semana.</p>",
+                unsafe_allow_html=True,
+            )
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Resultado (MXN)", f"{'-' if pyg_sem < 0 else '+'}{pesos(abs(pyg_sem))}",
+                      delta=f"{pyg_sem / monto * 100:+.2f}%")
+            s2.metric(f"VaR {nivel * 100:g}% (MXN)", pesos(r_sem["VaR"]))
+            s3.metric(f"CVaR {nivel * 100:g}% (MXN)", pesos(r_sem["CVaR"]))
+            s4.metric("¿Superó el VaR?", "Sí" if excede else "No")
+            if con_fx:
+                st.markdown(
+                    f"<p class='section-caption'>Desglose: el S&P 500 se movió <b>{(f_sp.iloc[-1] - 1) * 100:+.2f}%</b> "
+                    f"en dólares y el dólar <b>{(f_fx.iloc[-1] - 1) * 100:+.2f}%</b> frente al peso "
+                    f"(de {tipo_cambio.loc[base]:.4f} a {tipo_cambio.iloc[-1]:.4f} pesos por dólar).</p>",
+                    unsafe_allow_html=True,
+                )
+
+            fig_sem_var = go.Figure()
+            fig_sem_var.add_trace(go.Scatter(
+                x=valor.index, y=valor.values, mode="lines+markers", name="Valor de tu inversión",
+                line=dict(color="#3B82F6", width=2.6), marker=dict(size=8),
+                hovertemplate="%{x|%d/%m/%Y}<br>Valor: $%{y:,.2f} MXN<extra></extra>",
+            ))
+            fig_sem_var.add_hline(y=monto, line_color="#E2E8F0", line_dash="dot",
+                                  annotation_text="Monto invertido", annotation_position="top left",
+                                  annotation_font_color="#E2E8F0")
+            fig_sem_var.add_hline(y=monto - r_sem["VaR"], line_color="#FBBF24", line_dash="dash",
+                                  annotation_text=f"Umbral VaR {nivel * 100:g}%", annotation_position="bottom left",
+                                  annotation_font_color="#FBBF24")
+            fig_sem_var.add_hline(y=monto - r_sem["CVaR"], line_color="#F87171", line_dash="dash",
+                                  annotation_text=f"Pérdida media en la cola (CVaR)", annotation_position="bottom left",
+                                  annotation_font_color="#F87171")
+            estilo_grafica(fig_sem_var, "Tu inversión durante la semana", altura=340)
+            fig_sem_var.update_yaxes(tickprefix="$", tickformat=",.2f")
+            # Sin fines de semana: el eje solo muestra sesiones de mercado
+            fig_sem_var.update_xaxes(tickformat="%d/%m", dtick=86400000,
+                                     rangebreaks=[dict(bounds=["sat", "mon"])])
+            st.plotly_chart(fig_sem_var, use_container_width=True)
+
+            st.markdown("<br><hr style='border-color: rgba(255,255,255,0.1);'><br>", unsafe_allow_html=True)
+
+            # ---------- Semana siguiente (pronóstico vigente) ----------
+            sigma_sig = float(riesgo[col_sigma].iloc[-1])
+            sigma_sp_sig = float(riesgo["Pronostico"].iloc[-1])
+            r_sig = var_cvar_fhs(z_todos, sigma_sig, nivel, monto)
+            r_norm = var_cvar_normal(sigma_sig, nivel, monto)
+            if cerrada:
+                lunes_sig = lunes + pd.Timedelta(days=7)
+                titulo_sig = f"Semana siguiente ({lunes_sig:%d/%m} – {lunes_sig + pd.Timedelta(days=4):%d/%m})"
+            else:
+                titulo_sig = f"Próximos 5 días hábiles (desde el cierre del {ultimo:%d/%m})"
+            st.markdown(f"<p class='section-title'>{titulo_sig}</p>", unsafe_allow_html=True)
+            def anual(s):
+                return s * np.sqrt(252 / 5) * 100
+
+            if con_fx:
+                sigma_fx_sig = float(riesgo["sigma_fx"].iloc[-1])
+                rho_sig = float(riesgo["rho"].iloc[-1])
+                # VaR equivalente con el tipo de cambio cubierto, para comparar
+                z_cub = residuales_estandarizados(riesgo["Pronostico"], riesgo["Ret5"])
+                r_cub = var_cvar_fhs(z_cub, sigma_sp_sig, nivel, monto)
+                texto_vol = (
+                    f"El modelo pronostica para el S&P 500 una volatilidad de {anual(sigma_sp_sig):.1f}% anual; "
+                    f"el tipo de cambio aporta {anual(sigma_fx_sig):.1f}% anual (EWMA) con una correlación de "
+                    f"<b>{rho_sig:+.2f}</b> frente al índice. Combinadas, la volatilidad de tu inversión en pesos es de "
+                    f"<b>{anual(sigma_sig):.1f}% anual</b>. "
+                )
+                if r_sig["VaR"] < r_cub["VaR"]:
+                    texto_vol += (
+                        f"Aun así, el VaR en pesos ({mxn(r_sig['VaR'])}) es <b>menor</b> que con el tipo de cambio "
+                        f"cubierto ({mxn(r_cub['VaR'])}): en las caídas fuertes del S&P el peso suele depreciarse, "
+                        f"y los dólares que tienes valen más pesos justo cuando el índice pierde."
+                    )
+                else:
+                    texto_vol += (
+                        f"El VaR en pesos ({mxn(r_sig['VaR'])}) es mayor que con el tipo de cambio cubierto "
+                        f"({mxn(r_cub['VaR'])}): hoy la moneda suma riesgo en lugar de amortiguarlo."
+                    )
+            else:
+                texto_vol = (
+                    f"Pronóstico vigente de volatilidad del S&P 500: RV a 5 días = {sigma_sig:.4f}, "
+                    f"equivalente a {anual(sigma_sig):.1f}% anual."
+                )
+            st.markdown(
+                f"<p class='section-caption'>{texto_vol} Esto es lo que está en juego si inviertes "
+                f"<b>{mxn(monto)}</b> hoy.</p>",
+                unsafe_allow_html=True,
+            )
+            n1, n2, n3, n4 = st.columns(4)
+            n1.metric(f"VaR {nivel * 100:g}% (MXN)", pesos(r_sig["VaR"]))
+            n2.metric(f"CVaR {nivel * 100:g}% (MXN)", pesos(r_sig["CVaR"]))
+            n3.metric("VaR normal (MXN)", pesos(r_norm["VaR"]))
+            n4.metric("CVaR normal (MXN)", pesos(r_norm["CVaR"]))
+            st.markdown(
+                f"<p class='section-caption'>Lectura: en {int(round(nivel / p_cola))} de cada "
+                f"{int(round(1 / p_cola))} semanas con esta volatilidad, la pérdida no debería pasar de "
+                f"<b>{mxn(r_sig['VaR'])}</b> ({r_sig['VaR'] / monto * 100:.2f}% del monto). En la semana restante, "
+                f"la que sí lo supera, la pérdida promedio esperada es de <b>{mxn(r_sig['CVaR'])}</b> "
+                f"({r_sig['CVaR'] / monto * 100:.2f}%). Las dos tarjetas de la derecha suponen retornos normales"
+                + (": aquí se quedan cortas en el CVaR porque ignoran las colas pesadas del mercado.</p>"
+                   if r_norm["CVaR"] < r_sig["CVaR"] else
+                   ": aquí resultan más conservadoras que la simulación histórica, cuyas colas en pesos son "
+                   "más delgadas que las de una normal con la misma volatilidad.</p>"),
+                unsafe_allow_html=True,
+            )
+
+            escenarios = monto * (np.exp(z_todos.to_numpy() * sigma_sig) - 1.0)
+            fig_dist = go.Figure()
+            fig_dist.add_trace(go.Histogram(
+                x=escenarios, nbinsx=60, name="Escenarios",
+                marker=dict(color="#3B82F6", line=dict(width=0)), opacity=0.85,
+                hovertemplate="Resultado: $%{x:,.2f} MXN<br>Escenarios: %{y}<extra></extra>",
+            ))
+            fig_dist.add_vline(x=-r_sig["VaR"], line_color="#FBBF24", line_dash="dash",
+                               annotation_text=f"VaR −{mxn(r_sig['VaR'])}", annotation_position="top left",
+                               annotation_font_color="#FBBF24")
+            fig_dist.add_vline(x=-r_sig["CVaR"], line_color="#F87171", line_dash="dash",
+                               annotation_text=f"CVaR −{mxn(r_sig['CVaR'])}", annotation_position="bottom left",
+                               annotation_font_color="#F87171")
+            estilo_grafica(fig_dist, "Escenarios de ganancia / pérdida para la semana siguiente", altura=340, leyenda=False)
+            fig_dist.update_xaxes(tickprefix="$", tickformat=",.2f", title="Resultado de la semana (MXN)")
+            fig_dist.update_yaxes(title="Escenarios")
+            st.plotly_chart(fig_dist, use_container_width=True)
+            st.markdown(
+                f"<p class='section-caption'>Cada barra agrupa escenarios construidos con los {len(z_todos):,} "
+                f"retornos a 5 días (uno por sesión) observados desde que terminó el entrenamiento del modelo. "
+                f"Cada uno se divide entre la volatilidad pronosticada para él y se reescala a la "
+                f"volatilidad pronosticada para la semana siguiente (simulación histórica filtrada).</p>",
+                unsafe_allow_html=True,
+            )
+
+            st.markdown("<br><hr style='border-color: rgba(255,255,255,0.1);'><br>", unsafe_allow_html=True)
+
+            # ---------- Backtest ----------
+            st.markdown("<p class='section-title'>¿Qué tan confiable es este VaR?</p>", unsafe_allow_html=True)
+            st.markdown(
+                "<p class='section-caption'>Backtest de los últimos 2 años, una semana a la vez y sin solapamiento: "
+                "el VaR de cada semana se calcula con la información disponible el viernes anterior y se compara "
+                "con lo que realmente pasó. Si el VaR está bien calibrado, las semanas que lo superan deberían ser "
+                f"alrededor del {p_cola * 100:g}%.</p>",
+                unsafe_allow_html=True,
+            )
+            bt = backtest_semanal(riesgo[col_sigma], riesgo[col_ret], nivel, monto, anios=2)
+            if bt.empty:
+                st.info("No hay historial suficiente para el backtest.")
+            else:
+                n_bt, x_bt = len(bt), int(bt["Exceso"].sum())
+                p_kup = prueba_kupiec(n_bt, x_bt, nivel)
+                b1, b2, b3, b4 = st.columns(4)
+                b1.metric("Semanas", f"{n_bt}")
+                b2.metric("Excesos del VaR", f"{x_bt}")
+                b3.metric("Kupiec (p-valor)", f"{p_kup:.2f}",
+                          delta="calibrado" if p_kup >= 0.05 else "mal calibrado",
+                          delta_color="normal" if p_kup >= 0.05 else "inverse")
+                perdida_exc = -bt.loc[bt["Exceso"], "PyG"].mean() if x_bt else np.nan
+                cvar_exc = bt.loc[bt["Exceso"], "CVaR"].mean() if x_bt else np.nan
+                b4.metric("Pérdida en excesos", pesos(perdida_exc) if x_bt else "—")
+                detalle_exc = (
+                    f" En esas semanas la pérdida promedio fue de <b>{mxn(perdida_exc)}</b>, frente a un CVaR "
+                    f"pronosticado promedio de <b>{mxn(cvar_exc)}</b>." if x_bt else ""
+                )
+                st.markdown(
+                    f"<p class='section-caption'>{x_bt} de {n_bt} semanas superaron el VaR; con un "
+                    f"VaR bien calibrado se esperarían unas {n_bt * p_cola:.1f}.{detalle_exc}</p>",
+                    unsafe_allow_html=True,
+                )
+
+                fig_bt = go.Figure()
+                fig_bt.add_trace(go.Bar(
+                    x=bt.index, y=bt["PyG"], name="Resultado de la semana",
+                    marker=dict(color=np.where(bt["Exceso"], "#F87171", "#94A3B8")),
+                    hovertemplate="Semana desde el %{x|%d/%m/%Y}<br>Resultado: $%{y:,.2f} MXN<extra></extra>",
+                ))
+                fig_bt.add_trace(go.Scatter(
+                    x=bt.index, y=-bt["VaR"], name=f"−VaR {nivel * 100:g}%", mode="lines",
+                    line=dict(color="#FBBF24", width=2, shape="hv"),
+                    hovertemplate="VaR: −$%{customdata:,.2f} MXN<extra></extra>", customdata=bt["VaR"],
+                ))
+                fig_bt.add_trace(go.Scatter(
+                    x=bt.index, y=-bt["CVaR"], name=f"−CVaR {nivel * 100:g}%", mode="lines",
+                    line=dict(color="#F87171", width=1.4, dash="dot", shape="hv"),
+                    hovertemplate="CVaR: −$%{customdata:,.2f} MXN<extra></extra>", customdata=bt["CVaR"],
+                ))
+                estilo_grafica(fig_bt, f"Resultado semanal de {mxn(monto)} vs. VaR pronosticado", altura=380)
+                fig_bt.update_yaxes(tickprefix="$", tickformat=",.2f")
+                fig_bt.update_xaxes(tickformat="%d/%m/%y")
+                st.plotly_chart(fig_bt, use_container_width=True)
+                st.markdown(
+                    "<p class='section-caption'>Las barras rojas son las semanas en que la pérdida superó el VaR. "
+                    "La prueba de Kupiec contrasta si su frecuencia es compatible con el nivel de confianza elegido: "
+                    "un p-valor menor a 0.05 indica que el VaR subestima (o sobreestima) el riesgo.</p>",
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown(
+                "<p class='section-caption'><b>Supuestos:</b> "
+                + ("inversión en pesos sin cobertura: se compran dólares al tipo de cambio USD/MXN del cierre, se "
+                   "invierte en el S&P 500 y al final se regresa a pesos. La volatilidad del tipo de cambio y su "
+                   "correlación con el índice se estiman con un promedio exponencial (RiskMetrics, λ = 0.94); el "
+                   "cierre de Yahoo para USD/MXN no coincide exactamente con el del índice. "
+                   if con_fx else
+                   "exposición directa al índice S&P 500 con el tipo de cambio cubierto: el cálculo no incluye la "
+                   "variación del peso frente al dólar. ")
+                + "No incluye dividendos, comisiones ni el diferencial de compra-venta de divisas. "
+                "Las pérdidas se miden sobre precios de cierre.</p>",
+                unsafe_allow_html=True,
+            )
+
+        except Exception as e:
+            st.error(f"No fue posible calcular el valor en riesgo: {e}")
+
 # --- CONTENIDO PESTAÑA 3: SELECCIÓN DE MODELOS ---
 with tab3:
     st.markdown("""
@@ -1279,7 +1655,7 @@ with tab4:
     with texto_col:
         st.markdown("""
             <div class="autor-nombre">Cristian A. Materanda</div>
-            <div class="autor-rol">Matemático · Científico de Datos · Lógico Estadístico</div>
+            <div class="autor-rol">Matemático, lógico estadístico, científico de datos</div>
             <p class="autor-bio">
                 Mi labor profesional es presentar información estratégica obtenida a partir del
                 análisis de datos, la modelación estadística y el machine learning, con el objetivo
